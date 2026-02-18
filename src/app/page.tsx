@@ -15,7 +15,6 @@ interface Tab {
   passphrase?: string
 }
 
-// LocalStorage keys
 const SAVED_CONNECTIONS_KEY = 'webssh_saved_connections'
 
 function getSavedConnections(): ConnectionConfig[] {
@@ -31,15 +30,12 @@ function getSavedConnections(): ConnectionConfig[] {
 function saveConnection(config: ConnectionConfig) {
   try {
     const saved = getSavedConnections()
-    // Don't save duplicates
     const exists = saved.some(s => s.host === config.host && s.username === config.username)
     if (!exists) {
       saved.push(config)
       localStorage.setItem(SAVED_CONNECTIONS_KEY, JSON.stringify(saved))
     }
-  } catch {
-    // Ignore localStorage errors
-  }
+  } catch {}
 }
 
 function removeConnection(config: ConnectionConfig) {
@@ -47,9 +43,7 @@ function removeConnection(config: ConnectionConfig) {
     const saved = getSavedConnections()
     const filtered = saved.filter(s => !(s.host === config.host && s.username === config.username))
     localStorage.setItem(SAVED_CONNECTIONS_KEY, JSON.stringify(filtered))
-  } catch {
-    // Ignore localStorage errors
-  }
+  } catch {}
 }
 
 export default function Home() {
@@ -58,14 +52,10 @@ export default function Home() {
   const [isModalOpen, setIsModalOpen] = useState(false)
   const [savedConnections, setSavedConnections] = useState<ConnectionConfig[]>([])
 
-  // Load saved connections on mount
   useEffect(() => {
     const saved = getSavedConnections()
     setSavedConnections(saved)
-    
-    // Auto-connect to saved connections
     if (saved.length > 0) {
-      // Create tabs for saved connections
       const newTabs: Tab[] = saved.map((config, idx) => ({
         id: `saved-${idx}-${Date.now()}`,
         name: `${config.username}@${config.host}`,
@@ -77,9 +67,7 @@ export default function Home() {
         passphrase: config.passphrase,
       }))
       setTabs(newTabs)
-      if (newTabs.length > 0) {
-        setActiveTabId(newTabs[0].id)
-      }
+      setActiveTabId(newTabs[0].id)
     }
   }, [])
 
@@ -95,12 +83,9 @@ export default function Home() {
       privateKey: config.privateKey,
       passphrase: config.passphrase,
     }
-
-    // Save to localStorage
     saveConnection(config)
     setSavedConnections(getSavedConnections())
-
-    setTabs((prev) => [...prev, newTab])
+    setTabs(prev => [...prev, newTab])
     setActiveTabId(tabId)
     setIsModalOpen(false)
   }, [])
@@ -111,8 +96,8 @@ export default function Home() {
   }, [])
 
   const closeTab = useCallback((tabId: string) => {
-    setTabs((prev) => {
-      const newTabs = prev.filter((tab) => tab.id !== tabId)
+    setTabs(prev => {
+      const newTabs = prev.filter(tab => tab.id !== tabId)
       if (activeTabId === tabId) {
         setActiveTabId(newTabs.length > 0 ? newTabs[newTabs.length - 1].id : null)
       }
@@ -121,24 +106,26 @@ export default function Home() {
   }, [activeTabId])
 
   return (
-    <div className="min-h-screen bg-gray-900 flex flex-col">
+    <div className="h-full bg-white flex flex-col overflow-hidden">
+
       {/* Header */}
-      <header className="bg-gray-800 border-b border-gray-700 px-4 py-3">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="w-8 h-8 bg-gradient-to-br from-blue-500 to-purple-600 rounded-lg flex items-center justify-center">
-              <svg className="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <header className="bg-white border-b border-[#e4e4e7] px-4 h-12 flex items-center">
+        <div className="flex items-center justify-between w-full">
+          <div className="flex items-center gap-2.5">
+            <div className="w-6 h-6 bg-[#09090b] rounded flex items-center justify-center flex-shrink-0">
+              <svg className="w-3.5 h-3.5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
               </svg>
             </div>
-            <h1 className="text-lg font-semibold text-white">WebSSH Gateway</h1>
+            <span className="text-sm font-semibold text-[#09090b] tracking-tight">WebSSH Gateway</span>
           </div>
+
           <button
             onClick={() => setIsModalOpen(true)}
-            className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-500 transition-colors font-medium"
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#09090b] text-white text-xs font-medium rounded-md hover:bg-[#27272a] transition-colors duration-150"
           >
-            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M12 4v16m8-8H4" />
             </svg>
             <span className="hidden sm:inline">New Connection</span>
           </button>
@@ -147,22 +134,29 @@ export default function Home() {
 
       {/* Saved Connections Bar */}
       {savedConnections.length > 0 && (
-        <div className="bg-gray-800 border-b border-gray-700 px-4 py-2 flex items-center gap-2 overflow-x-auto">
-          <span className="text-xs text-gray-400 whitespace-nowrap">Saved:</span>
+        <div className="bg-[#f4f4f5] border-b border-[#e4e4e7] px-4 py-2 flex items-center gap-2 overflow-x-auto">
+          <span className="text-[10px] font-semibold text-[#a1a1aa] uppercase tracking-widest whitespace-nowrap">
+            Saved
+          </span>
+          <div className="w-px h-3 bg-[#d4d4d8]" />
           {savedConnections.map((conn, idx) => (
-            <div key={idx} className="flex items-center bg-gray-700 rounded-full">
+            <div
+              key={idx}
+              className="flex items-center bg-white border border-[#e4e4e7] rounded overflow-hidden shadow-sm"
+            >
               <button
                 onClick={() => {
                   const exists = tabs.some(t => t.host === conn.host && t.username === conn.username)
                   if (!exists) handleConnect(conn)
                 }}
-                className="px-3 py-1 text-gray-300 text-xs hover:text-white whitespace-nowrap"
+                className="px-2.5 py-1 text-[#3f3f46] text-xs hover:text-[#09090b] whitespace-nowrap transition-colors font-mono"
               >
                 {conn.username}@{conn.host}
               </button>
               <button
                 onClick={() => handleDeleteConnection(conn)}
-                className="pr-2 text-gray-500 hover:text-red-400 text-xs"
+                className="px-2 py-1 text-[#a1a1aa] hover:text-[#ef4444] text-xs transition-colors border-l border-[#e4e4e7]"
+                title="Remove"
               >
                 ×
               </button>
@@ -173,27 +167,31 @@ export default function Home() {
 
       {/* Tab Bar */}
       {tabs.length > 0 && (
-        <div className="bg-gray-800 border-b border-gray-700 flex overflow-x-auto">
+        <div className="bg-white border-b border-[#e4e4e7] flex overflow-x-auto">
           {tabs.map((tab) => (
             <div
               key={tab.id}
-              className={`group flex items-center gap-2 px-4 py-2 border-r border-gray-700 cursor-pointer min-w-max ${
+              className={`group flex items-center gap-2 px-4 py-2.5 border-r border-[#e4e4e7] cursor-pointer min-w-max transition-colors duration-150 ${
                 activeTabId === tab.id
-                  ? 'bg-gray-900 text-white border-t-2 border-t-blue-500'
-                  : 'text-gray-400 hover:text-white hover:bg-gray-750'
+                  ? 'bg-white text-[#09090b] border-b-2 border-b-[#09090b]'
+                  : 'bg-[#f4f4f5] text-[#71717a] hover:text-[#3f3f46] hover:bg-[#fafafa]'
               }`}
               onClick={() => setActiveTabId(tab.id)}
             >
-              <span className="text-sm font-medium">{tab.name}</span>
+              {activeTabId === tab.id && (
+                <span className="w-1.5 h-1.5 rounded-full bg-[#22c55e] flex-shrink-0" />
+              )}
+              <span className="text-xs font-mono font-medium">{tab.name}</span>
               <button
                 onClick={(e) => {
                   e.stopPropagation()
                   closeTab(tab.id)
                 }}
-                className="opacity-0 group-hover:opacity-100 text-gray-400 hover:text-white transition-opacity"
+                className="opacity-0 group-hover:opacity-100 text-[#a1a1aa] hover:text-[#09090b] transition-all ml-1"
+                title="Close"
               >
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18L18 6M6 6l12 12" />
                 </svg>
               </button>
             </div>
@@ -202,17 +200,18 @@ export default function Home() {
       )}
 
       {/* Main Content */}
-      <main className="flex-1 flex flex-col overflow-hidden">
+      <main className="flex-1 flex flex-col overflow-hidden bg-[#f4f4f5]">
         {tabs.length > 0 ? (
-          <div className="flex-1 p-4 flex flex-col overflow-hidden">
+          <div className="flex-1 relative overflow-hidden" style={{ padding: '0 0 0 0' }}>
             {tabs.map((tab) => (
               <div
                 key={tab.id}
-                className="flex-1 flex flex-col overflow-hidden"
-                style={{ 
-                  display: tab.id === activeTabId ? 'flex' : 'none',
-                  visibility: tab.id === activeTabId ? 'visible' : 'hidden',
-                  position: tab.id === activeTabId ? 'relative' : 'absolute',
+                className="sm:rounded-lg sm:border sm:border-[#e4e4e7] sm:shadow-sm overflow-hidden"
+                style={{
+                  position: 'absolute',
+                  inset: 0,
+                  margin: 'clamp(0px, 1.5vw, 12px)',
+                  display: tab.id === activeTabId ? 'block' : 'none',
                 }}
               >
                 <Terminal
@@ -229,23 +228,30 @@ export default function Home() {
             ))}
           </div>
         ) : (
-          <div className="flex-1 flex flex-col items-center justify-center text-gray-400 p-4">
-            <div className="w-24 h-24 bg-gray-800 rounded-full flex items-center justify-center mb-6">
-              <svg className="w-12 h-12 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
-              </svg>
+          /* Empty state */
+          <div className="flex-1 flex flex-col items-center justify-center p-8">
+            <div className="flex flex-col items-center gap-5 max-w-xs text-center">
+              <div className="w-14 h-14 bg-white border border-[#e4e4e7] rounded-xl flex items-center justify-center shadow-sm">
+                <svg className="w-7 h-7 text-[#d4d4d8]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                </svg>
+              </div>
+              <div className="space-y-1">
+                <h2 className="text-sm font-semibold text-[#09090b]">No active connections</h2>
+                <p className="text-xs text-[#71717a] leading-relaxed">
+                  Create a new SSH connection to get started. Connections are saved locally.
+                </p>
+              </div>
+              <button
+                onClick={() => setIsModalOpen(true)}
+                className="inline-flex items-center gap-2 px-4 py-2 bg-[#09090b] text-white text-sm font-medium rounded-md hover:bg-[#27272a] transition-colors duration-150"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M12 4v16m8-8H4" />
+                </svg>
+                New Connection
+              </button>
             </div>
-            <h2 className="text-xl font-semibold text-gray-300 mb-2">No Active Connections</h2>
-            <p className="text-center mb-6 max-w-md">Click "New Connection" or select a saved connection above.</p>
-            <button
-              onClick={() => setIsModalOpen(true)}
-              className="flex items-center gap-2 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-500 transition-colors font-medium"
-            >
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
-              </svg>
-              Create New Connection
-            </button>
           </div>
         )}
       </main>

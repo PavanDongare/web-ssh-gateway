@@ -1,8 +1,12 @@
 @import "tailwindcss";
 
 :root {
-  --background: #111827;
-  --foreground: #f3f4f6;
+  --background: #ffffff;
+  --foreground: #09090b;
+  --border: #e4e4e7;
+  --muted: #f4f4f5;
+  --muted-foreground: #71717a;
+  --ring: #a1a1aa;
 }
 
 @theme inline {
@@ -12,10 +16,18 @@
   --font-mono: var(--font-geist-mono);
 }
 
+html,
+body {
+  height: 100%;
+  overflow: hidden;
+}
+
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-geist-sans), -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 /* Terminal styling */
@@ -23,15 +35,10 @@ body {
   padding: 8px;
 }
 
-/* Hide the browser's native blinking caret on ghostty-web's internal textarea.
-   ghostty-web mounts a 1×1 opacity-0 textarea at position (0,0) of the canvas
-   for keyboard capture. The browser still renders its blinking insertion caret
-   there, producing a phantom cursor at the top-left of the terminal.
-   Setting caret-color: transparent removes it without affecting functionality. */
+/* Hide the browser's native blinking caret on ghostty-web's internal textarea. */
 #terminal-container textarea {
   caret-color: transparent !important;
 }
-
 
 /* Mobile touch improvements */
 @media (pointer: coarse) {
@@ -41,36 +48,35 @@ body {
   }
 }
 
-/* Scrollbar styling */
+/* Scrollbar styling — minimal */
 ::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 6px;
+  height: 6px;
 }
 
 ::-webkit-scrollbar-track {
-  background: #1f2937;
-  border-radius: 4px;
+  background: transparent;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #4b5563;
-  border-radius: 4px;
+  background: #d4d4d8;
+  border-radius: 3px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #6b7280;
+  background: #a1a1aa;
 }
 
 /* Tab scrollbar */
 .overflow-x-auto::-webkit-scrollbar {
-  height: 4px;
+  height: 3px;
 }
 
 .overflow-x-auto::-webkit-scrollbar-track {
-  background: #1f2937;
+  background: transparent;
 }
 
 .overflow-x-auto::-webkit-scrollbar-thumb {
-  background: #374151;
+  background: #e4e4e7;
   border-radius: 2px;
 }

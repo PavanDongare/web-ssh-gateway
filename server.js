@@ -4,6 +4,7 @@ const { parse } = require('url')
 const next = require('next')
 const WebSocket = require('ws')
 const ssh2 = require('ssh2')
+const { Terminal: XTerminal } = require('@xterm/xterm')
 
 // Suppress the deprecation warning
 process.emitWarning = () => {}
@@ -22,15 +23,172 @@ const SESSION_TIMEOUT_MS = 300000 // 5 minutes to reconnect
 // them on reconnect, restoring the terminal to its exact visual state.
 const MAX_OUTPUT_BUFFER = 200 * 1024 // 200 KB
 
-// SSH connection sessions map (tabId -> { conn, stream, ws, lastActivity })
+// SSH connection sessions map (tabId -> session object)
 const sessions = new Map()
 
+// ---------------------------------------------------------------------------
+// Binary frame protocol (Fix 6)
+// Mirrors src/lib/ws-protocol.ts — keep in sync.
+//
+// Frame layout:
+//   u8   type       — message type
+//   u16  payloadLen — payload length LE
+//   u8[] payload    — raw bytes
+// ---------------------------------------------------------------------------
+const MsgType = {
+  // Client → Server
+  AUTH:      0x01,
+  RECONNECT: 0x02,
+  DATA:      0x03,  // raw binary keystrokes
+  RESIZE:    0x04,
+  PING:      0x05,
+
+  // Server → Client
+  CONNECTED:    0x10,
+  RECONNECTED:  0x11,
+  REPLAY:       0x12,  // raw binary buffered output (fallback)
+  SSH_DATA:     0x13,  // raw binary live output
+  ERROR:        0x14,
+  DISCONNECTED: 0x15,
+  SNAPSHOT:     0x16,  // JSON: TerminalSnapshot — exact terminal state on reconnect
+}
+
+/** Encode a binary frame */
+function encodeFrame(type, payload) {
+  const buf = payload instanceof Buffer ? payload : Buffer.from(payload ?? [])
+  const frame = Buffer.allocUnsafe(3 + buf.length)
+  frame.writeUInt8(type, 0)
+  frame.writeUInt16LE(buf.length, 1)
+  buf.copy(frame, 3)
+  return frame
+}
+
+/** Encode a frame with a JSON payload */
+function encodeJsonFrame(type, data) {
+  return encodeFrame(type, Buffer.from(JSON.stringify(data), 'utf8'))
+}
+
+/** Decode a binary frame. Returns null on error. */
+function decodeFrame(raw) {
+  const buf = raw instanceof Buffer ? raw : Buffer.from(raw)
+  if (buf.length < 3) return null
+  const type   = buf.readUInt8(0)
+  const payLen = buf.readUInt16LE(1)
+  if (buf.length < 3 + payLen) return null
+  const payload = buf.slice(3, 3 + payLen)
+  return { type, payload }
+}
+
+// ---------------------------------------------------------------------------
+// Fix 7: Headless terminal snapshot helpers
+// Attribute bit flags — mirror ws-protocol.ts ATTR_* constants
+// ---------------------------------------------------------------------------
+const ATTR_BOLD          = 0x01
+const ATTR_ITALIC        = 0x02
+const ATTR_UNDERLINE     = 0x04
+const ATTR_DIM           = 0x08
+const ATTR_INVERSE       = 0x10
+const ATTR_INVISIBLE     = 0x20
+const ATTR_STRIKETHROUGH = 0x40
+const ATTR_BLINK         = 0x80
+
+/**
+ * Create a headless xterm Terminal instance for a session.
+ * This tracks the exact visual state of the terminal (cursor, colors, TUI apps).
+ */
+function createHeadlessTerminal(cols, rows) {
+  return new XTerminal({
+    cols,
+    rows,
+    allowProposedApi: true,
+    scrollback: 1000,
+  })
+}
+
+/**
+ * Serialize the headless terminal buffer into a TerminalSnapshot.
+ * Only the visible rows (viewport) are included — same as VibeTunnel's approach.
+ */
+function serializeSnapshot(term) {
+  const buf = term.buffer.active
+  const cols = term.cols
+  const rows = term.rows
+
+  // Viewport: the last `rows` lines of the buffer
+  const bufLen    = buf.length
+  const startLine = Math.max(0, bufLen - rows)
+
+  const lines = []
+  const cellObj = {}  // reuse object for getCell
+
+  for (let r = 0; r < rows; r++) {
+    const lineIdx = startLine + r
+    const line    = buf.getLine(lineIdx)
+    const cells   = []
+
+    if (!line) {
+      // Empty line — push a single space cell
+      cells.push({ ch: ' ', w: 1, fg: -1, bg: -1, at: 0 })
+    } else {
+      for (let c = 0; c < cols; c++) {
+        const cell = line.getCell(c, cellObj)
+        if (!cell) continue
+
+        const w = cell.getWidth()
+        if (w === 0) continue  // continuation cell for wide char
+
+        let at = 0
+        if (cell.isBold())          at |= ATTR_BOLD
+        if (cell.isItalic())        at |= ATTR_ITALIC
+        if (cell.isUnderline())     at |= ATTR_UNDERLINE
+        if (cell.isDim())           at |= ATTR_DIM
+        if (cell.isInverse())       at |= ATTR_INVERSE
+        if (cell.isInvisible())     at |= ATTR_INVISIBLE
+        if (cell.isStrikethrough()) at |= ATTR_STRIKETHROUGH
+        if (cell.isBlink())         at |= ATTR_BLINK
+
+        const fg = cell.getFgColor()
+        const bg = cell.getBgColor()
+
+        cells.push({
+          ch: cell.getChars() || ' ',
+          w,
+          fg: (fg === undefined || fg === null) ? -1 : fg,
+          bg: (bg === undefined || bg === null) ? -1 : bg,
+          at,
+        })
+      }
+    }
+
+    lines.push(cells)
+  }
+
+  // Cursor position relative to viewport
+  const cursorY = buf.cursorY
+  const cursorX = buf.cursorX
+
+  // viewportY: how far from the bottom (0 = at bottom, positive = scrolled up)
+  const viewportY = Math.max(0, bufLen - rows - buf.viewportY)
+
+  return {
+    cols,
+    rows,
+    cursorX,
+    cursorY,
+    viewportY,
+    lines,
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Cleanup expired sessions every 30 seconds
+// ---------------------------------------------------------------------------
 setInterval(() => {
   const now = Date.now()
   for (const [tabId, session] of sessions) {
     if (now - session.lastActivity > SESSION_TIMEOUT_MS) {
       console.log(`Session ${tabId} expired, closing SSH`)
+      if (session.headlessTerm) { session.headlessTerm.dispose(); session.headlessTerm = null }
       if (session.stream) session.stream.close()
       if (session.conn) session.conn.end()
       sessions.delete(tabId)
@@ -52,9 +210,7 @@ app.prepare().then(async () => {
 
   const wss = new WebSocket.Server({ noServer: true, clientTracking: true })
 
-  // Next.js 13.1+ exposes getUpgradeHandler() so its HMR WebSocket
-  // (/_next/webpack-hmr) works correctly with a custom server.
-  // Without this, HMR upgrade requests have no handler and retry forever.
+  // Next.js 13.1+ exposes getUpgradeHandler() so its HMR WebSocket works correctly
   const nextUpgradeHandler = await app.getUpgradeHandler()
 
   server.on('upgrade', (req, socket, head) => {
@@ -64,12 +220,11 @@ app.prepare().then(async () => {
         wss.emit('connection', client, req)
       })
     } else {
-      // Let Next.js handle HMR and any other internal WebSocket upgrades
       nextUpgradeHandler(req, socket, head)
     }
   })
 
-  // Heartbeat to keep connections alive - ping every 30 seconds
+  // Heartbeat — ping every 30 seconds, terminate dead connections
   const heartbeatInterval = setInterval(() => {
     wss.clients.forEach((ws) => {
       if (ws.isAlive === false) {
@@ -81,93 +236,99 @@ app.prepare().then(async () => {
     })
   }, 30000)
 
-  wss.on('close', () => {
-    clearInterval(heartbeatInterval)
-  })
+  wss.on('close', () => clearInterval(heartbeatInterval))
 
-  wss.on('connection', (ws, req) => {
+  wss.on('connection', (ws) => {
     let tabId = null
 
-    // Mark connection as alive for heartbeat
     ws.isAlive = true
-    ws.on('pong', () => {
-      ws.isAlive = true
-    })
+    ws.on('pong', () => { ws.isAlive = true })
+
+    // Accept binary frames (Fix 6)
+    ws.binaryType = 'nodebuffer'
 
     console.log('New WebSocket connection')
 
     ws.on('message', (raw) => {
       try {
-        const msg = JSON.parse(raw.toString())
+        const frame = decodeFrame(raw)
+        if (!frame) {
+          console.warn('Received malformed frame, ignoring')
+          return
+        }
 
-        switch (msg.type) {
-          case 'auth':
-            // Each tab gets its own session — tabId is the unique key
+        switch (frame.type) {
+          case MsgType.AUTH: {
+            const msg = JSON.parse(frame.payload.toString('utf8'))
             tabId = msg.tabId
-
-            // Create new session
             console.log(`Creating new session for tab ${tabId} (${msg.username}@${msg.host})`)
             handleAuth(ws, msg, (session) => {
               sessions.set(tabId, session)
             })
             break
+          }
 
-          case 'reconnect':
-            // Client trying to reconnect to existing session
+          case MsgType.RECONNECT: {
+            const msg = JSON.parse(frame.payload.toString('utf8'))
             tabId = msg.tabId
             const session = sessions.get(tabId)
             if (session && session.conn) {
               console.log(`Reconnecting to session ${tabId}`)
               attachToSession(ws, tabId, session)
             } else {
-              ws.send(JSON.stringify({ 
-                type: 'error', 
-                message: 'Session expired. Please reconnect.' 
-              }))
+              ws.send(encodeJsonFrame(MsgType.ERROR, { message: 'Session expired. Please reconnect.' }))
             }
             break
+          }
 
-          case 'data':
-            // Send keystrokes to SSH
+          case MsgType.DATA: {
+            // Fix 6: raw binary keystrokes — no UTF-8 decode, no JSON parse
+            // Fix 3: backpressure — pause WS if SSH write buffer is full
             const dataSession = sessions.get(tabId)
             if (dataSession?.stream && dataSession.stream.writable) {
-              dataSession.stream.write(msg.data)
+              const canContinue = dataSession.stream.write(frame.payload)
               dataSession.lastActivity = Date.now()
+              if (!canContinue) {
+                ws.pause()
+                dataSession.stream.once('drain', () => ws.resume())
+              }
             }
             break
+          }
 
-          case 'resize':
-            // Resize terminal
+          case MsgType.RESIZE: {
+            const { cols, rows } = JSON.parse(frame.payload.toString('utf8'))
             const resizeSession = sessions.get(tabId)
             if (resizeSession?.stream) {
-              resizeSession.stream.setWindow(msg.rows, msg.cols)
+              resizeSession.stream.setWindow(rows, cols)
               resizeSession.lastActivity = Date.now()
+              // Fix 7: resize the headless terminal to match
+              if (resizeSession.headlessTerm) {
+                resizeSession.headlessTerm.resize(cols, rows)
+              }
             }
             break
+          }
 
-          case 'ping':
-            // Client ping for keepalive
+          case MsgType.PING: {
             const pingSession = sessions.get(tabId)
-            if (pingSession) {
-              pingSession.lastActivity = Date.now()
-            }
+            if (pingSession) pingSession.lastActivity = Date.now()
             break
+          }
 
           default:
-            console.log('Unknown message type:', msg.type)
+            console.log('Unknown frame type:', frame.type)
         }
       } catch (err) {
-        console.error('Error processing message:', err)
+        console.error('Error processing frame:', err)
       }
     })
 
     ws.on('close', () => {
       console.log(`WebSocket closed for ${tabId}`)
-      
-      // IMPORTANT: Don't close SSH immediately! Keep session alive for reconnection
       const session = sessions.get(tabId)
       if (session) {
-        session.ws = null  // Detach WebSocket but keep SSH
+        session.ws = null
         session.lastActivity = Date.now()
         console.log(`Session ${tabId} kept alive for reconnection (${SESSION_TIMEOUT_MS}ms)`)
       }
@@ -183,54 +344,60 @@ app.prepare().then(async () => {
     console.log(`> Ready on http://${hostname}:${port}`)
     console.log(`> WebSocket endpoint: ws://${hostname}:${port}/api/ssh`)
     console.log(`> Session persistence: ${SESSION_TIMEOUT_MS}ms`)
+    console.log(`> Protocol: binary frames + headless terminal snapshot (Fix 6+7)`)
   })
 })
 
 /**
  * Attach a new WebSocket to an existing SSH session.
  *
- * The data/close/stderr handlers set up in handleAuth already reference
- * session.ws, so just swapping that pointer is enough — no new listeners
- * needed, no listener accumulation across reconnects.
- *
- * The client is expected to send a 'resize' message immediately after
- * receiving 'reconnected', which will call stream.setWindow with the
- * actual current terminal dimensions.
+ * Fix 7: If a headless terminal exists, send a SNAPSHOT frame so the client
+ * can render the exact terminal state (cursor, colors, TUI apps like vim/htop).
+ * Falls back to raw REPLAY if no headless terminal is available.
  */
 function attachToSession(ws, tabId, session) {
   session.ws = ws
   session.lastActivity = Date.now()
 
-  // Replay buffered output so the terminal shows its current visual state
-  if (session.outputBuffer) {
-    ws.send(JSON.stringify({ type: 'replay', data: session.outputBuffer }))
+  if (session.headlessTerm) {
+    // Fix 7: serialize exact terminal state and send as SNAPSHOT
+    try {
+      const snapshot = serializeSnapshot(session.headlessTerm)
+      ws.send(encodeJsonFrame(MsgType.SNAPSHOT, snapshot))
+      console.log(`Sent terminal snapshot for session ${tabId} (${snapshot.cols}x${snapshot.rows}, ${snapshot.lines.length} lines)`)
+    } catch (err) {
+      console.error(`Failed to serialize snapshot for ${tabId}, falling back to replay:`, err)
+      // Fallback: raw replay
+      if (session.outputBuffer && session.outputBuffer.length > 0) {
+        ws.send(encodeFrame(MsgType.REPLAY, session.outputBuffer))
+      }
+    }
+  } else if (session.outputBuffer && session.outputBuffer.length > 0) {
+    // Fallback: raw binary replay
+    ws.send(encodeFrame(MsgType.REPLAY, session.outputBuffer))
   }
 
-  // Signal reconnect — client will respond with a 'resize' message
-  ws.send(JSON.stringify({ type: 'reconnected' }))
-
+  ws.send(encodeFrame(MsgType.RECONNECTED))
   console.log(`Reattached WebSocket to session ${tabId}`)
 }
 
 /**
- * Handle SSH authentication and connection
+ * Handle SSH authentication and connection.
  */
 function handleAuth(ws, msg, onReady) {
   const { host, port = 22, username, password, privateKey, passphrase, tabId } = msg
 
   if (!host || !username) {
-    ws.send(JSON.stringify({ type: 'error', message: 'Host and username are required' }))
+    ws.send(encodeJsonFrame(MsgType.ERROR, { message: 'Host and username are required' }))
     return
   }
 
   if (!password && !privateKey) {
-    ws.send(JSON.stringify({ type: 'error', message: 'Password or private key is required' }))
+    ws.send(encodeJsonFrame(MsgType.ERROR, { message: 'Password or private key is required' }))
     return
   }
 
   const conn = new ssh2.Client()
-  // Hoisted so conn.on('close') can reference the same session object
-  // as the stream handlers set up inside conn.on('ready').
   let session = null
 
   const config = {
@@ -241,88 +408,95 @@ function handleAuth(ws, msg, onReady) {
     keepaliveInterval: 30000,
   }
 
-  // Add authentication method
   if (password) {
     config.password = password
   } else if (privateKey) {
     config.privateKey = privateKey
-    if (passphrase) {
-      config.passphrase = passphrase
-    }
+    if (passphrase) config.passphrase = passphrase
   }
 
   conn.on('ready', () => {
     console.log(`SSH connected to ${host}:${port}`)
 
-    // Open an interactive shell
     conn.shell(
       { term: 'xterm-256color', cols: 80, rows: 24 },
       (err, stream) => {
         if (err) {
-          ws.send(JSON.stringify({ type: 'error', message: `Shell error: ${err.message}` }))
+          ws.send(encodeJsonFrame(MsgType.ERROR, { message: `Shell error: ${err.message}` }))
           conn.end()
           return
         }
 
         console.log('Shell opened')
 
-        // Assign to the hoisted let so conn.on('close') can see it too
-        session = { conn, stream, ws, lastActivity: Date.now(), outputBuffer: '' }
+        // Fix 7: create a headless terminal to track exact visual state
+        const headlessTerm = createHeadlessTerminal(80, 24)
 
-        const appendToBuffer = (text) => {
-          session.outputBuffer += text
-          if (session.outputBuffer.length > MAX_OUTPUT_BUFFER) {
-            // Trim from the front, keeping the most recent output
-            session.outputBuffer = session.outputBuffer.slice(-MAX_OUTPUT_BUFFER)
+        // Fix 6: outputBuffer is now a raw Buffer (binary-safe), not a string
+        session = {
+          conn,
+          stream,
+          ws,
+          lastActivity: Date.now(),
+          outputBuffer: Buffer.alloc(0),
+          headlessTerm,  // Fix 7: headless terminal for snapshot
+        }
+
+        const appendToBuffer = (chunk) => {
+          // chunk is a Buffer from ssh2 — keep it binary
+          const combined = Buffer.concat([session.outputBuffer, chunk])
+          if (combined.length > MAX_OUTPUT_BUFFER) {
+            session.outputBuffer = combined.slice(combined.length - MAX_OUTPUT_BUFFER)
+          } else {
+            session.outputBuffer = combined
+          }
+
+          // Fix 7: feed raw bytes into the headless terminal so it tracks state
+          // xterm.write() accepts Buffer/Uint8Array directly
+          if (session.headlessTerm) {
+            session.headlessTerm.write(chunk)
           }
         }
 
         // Server-side output batching — accumulate SSH chunks for up to 10ms
-        // before sending over WebSocket. SSH can produce hundreds of tiny
-        // writes per second (e.g. ls output); batching them reduces WebSocket
-        // frame overhead significantly without adding perceptible latency.
-        let batchBuf = ''
+        let batchChunks = []
         let batchTimer = null
         const flushBatch = () => {
           batchTimer = null
-          if (!batchBuf) return
-          const text = batchBuf
-          batchBuf = ''
+          if (batchChunks.length === 0) return
+          const combined = Buffer.concat(batchChunks)
+          batchChunks = []
           if (session.ws?.readyState === WebSocket.OPEN) {
-            session.ws.send(JSON.stringify({ type: 'data', data: text }))
+            // Fix 6: send raw binary SSH_DATA frame
+            session.ws.send(encodeFrame(MsgType.SSH_DATA, combined))
           }
         }
 
-        // Pipe SSH output to WebSocket and into the rolling buffer.
-        // Use session.ws (not the closed-over ws) so reconnects automatically
-        // route to the new WebSocket without adding a second handler.
+        // Pipe SSH stdout → WebSocket (binary-safe) + headless terminal
         stream.on('data', (data) => {
-          const text = data.toString('utf-8')
-          appendToBuffer(text)
-          batchBuf += text
+          appendToBuffer(data)
+          batchChunks.push(data)
           if (!batchTimer) batchTimer = setTimeout(flushBatch, 10)
         })
 
         stream.on('close', () => {
           console.log('Stream closed')
           if (batchTimer) { clearTimeout(batchTimer); batchTimer = null }
+          if (session.headlessTerm) { session.headlessTerm.dispose(); session.headlessTerm = null }
           if (session.ws?.readyState === WebSocket.OPEN) {
-            session.ws.send(JSON.stringify({ type: 'disconnected' }))
+            session.ws.send(encodeFrame(MsgType.DISCONNECTED))
           }
           sessions.delete(tabId)
           conn.end()
         })
 
         stream.stderr.on('data', (data) => {
-          const text = data.toString('utf-8')
-          appendToBuffer(text)
-          batchBuf += text
+          appendToBuffer(data)
+          batchChunks.push(data)
           if (!batchTimer) batchTimer = setTimeout(flushBatch, 10)
         })
 
-        // Notify client that connection is ready
-        ws.send(JSON.stringify({ type: 'connected' }))
-
+        ws.send(encodeFrame(MsgType.CONNECTED))
         onReady(session)
       }
     )
@@ -330,21 +504,21 @@ function handleAuth(ws, msg, onReady) {
 
   conn.on('error', (err) => {
     console.error('SSH connection error:', err)
-    ws.send(JSON.stringify({ type: 'error', message: `SSH error: ${err.message}` }))
+    ws.send(encodeJsonFrame(MsgType.ERROR, { message: `SSH error: ${err.message}` }))
   })
 
   conn.on('close', () => {
     console.log('SSH connection closed')
+    if (session?.headlessTerm) { session.headlessTerm.dispose(); session.headlessTerm = null }
     if (session?.ws?.readyState === WebSocket.OPEN) {
-      session.ws.send(JSON.stringify({ type: 'disconnected' }))
+      session.ws.send(encodeFrame(MsgType.DISCONNECTED))
     }
     sessions.delete(tabId)
   })
 
-  // Initiate connection
   try {
     conn.connect(config)
   } catch (err) {
-    ws.send(JSON.stringify({ type: 'error', message: `Connection failed: ${err.message}` }))
+    ws.send(encodeJsonFrame(MsgType.ERROR, { message: `Connection failed: ${err.message}` }))
   }
 }

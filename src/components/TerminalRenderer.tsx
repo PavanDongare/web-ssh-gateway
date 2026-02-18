@@ -6,6 +6,11 @@
  * Pure terminal rendering component — faithful React port of vibetunnel's
  * terminal.ts (LitElement → React, same logic, same options).
  *
+ * Key insight from VibeTunnel source:
+ *   - disableStdin: false  → Terminal's built-in InputHandler captures keydown
+ *   - term.onData()        → fires when user types, forward to SSH server
+ *   - No manual InputHandler needed — Terminal.open() creates one automatically
+ *
  * Responsibilities:
  *   - Load ghostty-web WASM (singleton)
  *   - Mount terminal canvas into the DOM
@@ -14,6 +19,7 @@
  *   - Track scroll position, show scroll-to-bottom button
  *   - Handle paste via hidden textarea
  *   - Expose write() and scrollToBottom() via ref
+ *   - Live auto-theme via MutationObserver on <html data-theme>
  *
  * NOT responsible for: WebSocket, SSH, reconnection logic.
  */
@@ -76,7 +82,7 @@ const TerminalRenderer = forwardRef<TerminalRendererHandle, TerminalRendererProp
     const roRef        = useRef<ResizeObserver | null>(null)
 
     // --- pending output (vibetunnel pattern: buffer before terminal ready) ---
-    const pendingOutputRef      = useRef('')
+    const pendingOutputRef       = useRef('')
     const pendingFollowCursorRef = useRef(true)
 
     // --- last known dimensions (skip redundant resize calls) ---
@@ -84,7 +90,7 @@ const TerminalRenderer = forwardRef<TerminalRendererHandle, TerminalRendererProp
     const lastRowsRef = useRef(0)
 
     // --- mobile width locking (vibetunnel pattern) ---
-    const isMobileRef                = useRef(false)
+    const isMobileRef                  = useRef(false)
     const mobileWidthResizeCompleteRef = useRef(false)
 
     // --- scroll-to-bottom button ---
@@ -105,7 +111,6 @@ const TerminalRenderer = forwardRef<TerminalRendererHandle, TerminalRendererProp
     useImperativeHandle(ref, () => ({
       write(data: string, followCursor = true) {
         if (!termRef.current) {
-          // Buffer until terminal is ready — same as vibetunnel pendingOutput
           pendingOutputRef.current += data
           pendingFollowCursorRef.current = pendingFollowCursorRef.current && followCursor
           return
@@ -138,26 +143,20 @@ const TerminalRenderer = forwardRef<TerminalRendererHandle, TerminalRendererProp
       let cols  = Math.max(20, Math.floor(proposed.cols))
       const rows = Math.max(6,  Math.floor(proposed.rows))
 
-      // maxCols constraint (vibetunnel: computeConstrainedCols)
       if (maxCols > 0) cols = Math.min(cols, maxCols)
 
-      // Mobile width lock — once set, don't change cols on mobile
-      // (vibetunnel: isMobile && mobileWidthResizeComplete && lastCols)
       if (isMobileRef.current && mobileWidthResizeCompleteRef.current && lastColsRef.current) {
         cols = lastColsRef.current
       }
 
-      // Skip if nothing actually changed
       if (cols === lastColsRef.current && rows === lastRowsRef.current) return
 
       lastColsRef.current = cols
       lastRowsRef.current = rows
 
       term.resize(cols, rows)
-      // onResize fires via term.onResize below — no need to call it here
     }, [])
 
-    // vibetunnel uses requestAnimationFrame for resize scheduling
     const requestFit = useCallback((source: string) => {
       requestAnimationFrame(() => fitTerminal(source))
     }, [fitTerminal])
@@ -168,37 +167,42 @@ const TerminalRenderer = forwardRef<TerminalRendererHandle, TerminalRendererProp
     useEffect(() => {
       if (!containerRef.current) return
 
-      let aborted = false  // StrictMode double-mount guard
+      let aborted = false
 
       const init = async () => {
         const ghostty = await ensureGhostty()
         if (aborted || !containerRef.current) return
 
+        // Guard: don't double-init if StrictMode already ran this
+        if (termRef.current) return
+
         const prefs = TerminalPreferencesManager.getInstance()
 
-        // --- Create terminal (exact vibetunnel constructor options) ---
+        // disableStdin: false — Terminal's built-in InputHandler captures keydown
+        // and fires term.onData() with properly encoded VT sequences.
+        // This is the same approach VibeTunnel uses.
         const term = new GhosttyTerminal({
-          cols: 80,
-          rows: 24,
-          fontSize:            prefs.getFontSize(),
-          fontFamily:          TERMINAL_FONT_FAMILY,
-          theme:               getThemeColors(prefs.getTheme()),
-          cursorBlink:         true,
+          cols:                 80,
+          rows:                 24,
+          fontSize:             prefs.getFontSize(),
+          fontFamily:           TERMINAL_FONT_FAMILY,
+          theme:                getThemeColors(prefs.getTheme()),
+          cursorBlink:          true,
           smoothScrollDuration: 120,
+          disableStdin:         false,
           ghostty,
         })
 
         const fit = new FitAddon()
         term.loadAddon(fit)
 
-        // Clear container before mounting (vibetunnel: container.innerHTML = '')
         containerRef.current.innerHTML = ''
         term.open(containerRef.current)
 
         termRef.current = term
         fitRef.current  = fit
 
-        // --- Flush pending output (vibetunnel pattern) ---
+        // Flush pending output
         if (pendingOutputRef.current) {
           const pending      = pendingOutputRef.current
           const followCursor = pendingFollowCursorRef.current
@@ -209,12 +213,13 @@ const TerminalRenderer = forwardRef<TerminalRendererHandle, TerminalRendererProp
           })
         }
 
-        // --- onData: user typed → parent sends to SSH ---
+        // term.onData fires when user types (via built-in InputHandler)
+        // Forward to SSH server via WebSocket
         term.onData((text) => {
           onDataRef.current(text)
         })
 
-        // --- onResize: terminal resized → parent sends to SSH ---
+        // term.onResize fires after terminal.resize() — send new dims to SSH
         term.onResize(({ cols, rows }) => {
           lastColsRef.current = cols
           lastRowsRef.current = rows
@@ -222,7 +227,7 @@ const TerminalRenderer = forwardRef<TerminalRendererHandle, TerminalRendererProp
           onResizeRef.current(cols, rows)
         })
 
-        // --- onScroll: track follow-cursor (vibetunnel pattern) ---
+        // Track scroll position for follow-cursor button
         term.onScroll(() => {
           const vY = term.getViewportY?.() ?? 0
           const atBottom = vY <= 0.5
@@ -230,18 +235,41 @@ const TerminalRenderer = forwardRef<TerminalRendererHandle, TerminalRendererProp
           setShowScrollBtn(!atBottom)
         })
 
-        // --- ResizeObserver (vibetunnel uses this, not window.resize) ---
+        // ResizeObserver — vibetunnel uses this, not window.resize
         roRef.current = new ResizeObserver(() => {
           isMobileRef.current = window.innerWidth < 768
           requestFit('resize-observer')
         })
         roRef.current.observe(containerRef.current!)
 
-        // --- Initial fit (vibetunnel: requestResize('initial')) ---
         isMobileRef.current = window.innerWidth < 768
         requestFit('initial')
 
+        // Live auto-theme: watch <html data-theme> for OS/user theme changes
+        const themeObserver = new MutationObserver(() => {
+          if (prefs.getTheme() === 'auto') {
+            term.options.theme = getThemeColors('auto')
+          }
+        })
+        themeObserver.observe(document.documentElement, {
+          attributes:      true,
+          attributeFilter: ['data-theme', 'class'],
+        })
+
+        const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)')
+        const handleMediaChange = () => {
+          if (prefs.getTheme() === 'auto') {
+            term.options.theme = getThemeColors('auto')
+          }
+        }
+        mediaQuery.addEventListener('change', handleMediaChange)
+
         onReadyRef.current?.()
+
+        // Stash cleanup refs on the term object
+        ;(term as unknown as { _themeObserver: MutationObserver })._themeObserver = themeObserver
+        ;(term as unknown as { _mediaQuery: MediaQueryList })._mediaQuery = mediaQuery
+        ;(term as unknown as { _handleMediaChange: () => void })._handleMediaChange = handleMediaChange
       }
 
       init()
@@ -250,6 +278,17 @@ const TerminalRenderer = forwardRef<TerminalRendererHandle, TerminalRendererProp
         aborted = true
         roRef.current?.disconnect()
         roRef.current = null
+
+        const t = termRef.current as unknown as {
+          _themeObserver?: MutationObserver
+          _mediaQuery?: MediaQueryList
+          _handleMediaChange?: () => void
+        } | null
+        t?._themeObserver?.disconnect()
+        if (t?._mediaQuery && t?._handleMediaChange) {
+          t._mediaQuery.removeEventListener('change', t._handleMediaChange)
+        }
+
         termRef.current?.dispose()
         termRef.current = null
         fitRef.current  = null
@@ -267,10 +306,10 @@ const TerminalRenderer = forwardRef<TerminalRendererHandle, TerminalRendererProp
 
     // -----------------------------------------------------------------------
     // Paste handler — forward clipboard text to SSH via onData
-    // (vibetunnel: hidden textarea + paste event)
+    // Terminal's built-in paste handler fires term.onData() for bracketed paste,
+    // but we also handle React-level paste events for the outer wrapper div.
     // -----------------------------------------------------------------------
     const handlePaste = (e: React.ClipboardEvent) => {
-      // Images / files — ignore
       if (e.clipboardData.files.length > 0) return
       const text = e.clipboardData.getData('text/plain')
       if (!text) return
@@ -284,44 +323,31 @@ const TerminalRenderer = forwardRef<TerminalRendererHandle, TerminalRendererProp
     ).background ?? '#282A36'
 
     // -----------------------------------------------------------------------
-    // Render — matches vibetunnel's render() structure
+    // Render
     // -----------------------------------------------------------------------
     return (
       <div
-        style={{ position: 'absolute', inset: 0, backgroundColor: bgColor, padding: '10px 14px', boxSizing: 'border-box' }}
+        style={{
+          position:        'absolute',
+          inset:           0,
+          backgroundColor: bgColor,
+          padding:         'clamp(4px, 1.5vw, 10px) clamp(4px, 2vw, 14px)',
+          boxSizing:       'border-box',
+        }}
         onPaste={handlePaste}
       >
-        {/* Hidden textarea for native paste capture (vibetunnel pattern) */}
-        <textarea
-          aria-hidden="true"
-          tabIndex={-1}
-          autoCapitalize="off"
-          autoCorrect="off"
-          spellCheck={false}
-          style={{
-            position: 'absolute',
-            left: -9999,
-            top: 0,
-            width: 1,
-            height: 1,
-            opacity: 0,
-            pointerEvents: 'none',
-          }}
-          onPaste={handlePaste}
-        />
-
         {/* Terminal canvas mount point */}
         <div
           ref={containerRef}
           id="terminal-container"
           style={{
-            width:    '100%',
-            height:   '100%',
-            overflow: 'hidden',
-            fontFamily:           TERMINAL_FONT_FAMILY,
-            touchAction:          'manipulation',
-            WebkitUserSelect:     'text',
-            userSelect:           'text',
+            width:             '100%',
+            height:            '100%',
+            overflow:          'hidden',
+            fontFamily:        TERMINAL_FONT_FAMILY,
+            touchAction:       'manipulation',
+            WebkitUserSelect:  'text',
+            userSelect:        'text',
           }}
         />
 
@@ -330,27 +356,35 @@ const TerminalRenderer = forwardRef<TerminalRendererHandle, TerminalRendererProp
           <VoiceInput onTranscript={onTranscript} />
         )}
 
-        {/* Scroll-to-bottom button (vibetunnel pattern) */}
+        {/* Scroll-to-bottom button */}
         {showScrollBtn && (
           <button
             type="button"
             onClick={handleScrollToBottom}
             style={{
-              position:     'absolute',
-              right:        12,
-              bottom:       12,
-              zIndex:       20,
-              background:   'rgba(0,0,0,0.55)',
-              color:        '#fff',
-              border:       '1px solid rgba(255,255,255,0.18)',
-              borderRadius: 10,
-              padding:      '6px 10px',
-              fontFamily:   TERMINAL_FONT_FAMILY,
-              fontSize:     12,
-              cursor:       'pointer',
+              position:      'absolute',
+              right:         12,
+              bottom:        12,
+              zIndex:        20,
+              background:    'rgba(255,255,255,0.92)',
+              color:         '#3f3f46',
+              border:        '1px solid #e4e4e7',
+              borderRadius:  6,
+              padding:       '5px 10px',
+              fontFamily:    TERMINAL_FONT_FAMILY,
+              fontSize:      11,
+              cursor:        'pointer',
+              letterSpacing: '0.01em',
+              display:       'flex',
+              alignItems:    'center',
+              gap:           4,
+              boxShadow:     '0 1px 4px rgba(0,0,0,0.08)',
             }}
           >
-            ↓ Scroll to bottom
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 5v14M5 12l7 7 7-7"/>
+            </svg>
+            Scroll to bottom
           </button>
         )}
       </div>

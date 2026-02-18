@@ -1,7 +1,24 @@
 'use client'
 
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import TerminalRenderer, { type TerminalRendererHandle } from './TerminalRenderer'
+import {
+  MsgType,
+  encodeFrame,
+  encodeJsonFrame,
+  decodeFrame,
+  decodeJsonPayload,
+  type TerminalSnapshot,
+  type SnapshotCell,
+  ATTR_BOLD,
+  ATTR_ITALIC,
+  ATTR_UNDERLINE,
+  ATTR_DIM,
+  ATTR_INVERSE,
+  ATTR_INVISIBLE,
+  ATTR_STRIKETHROUGH,
+  ATTR_BLINK,
+} from '@/lib/ws-protocol'
 
 interface TerminalProps {
   tabId: string
@@ -16,8 +33,117 @@ interface TerminalProps {
   onError?: (message: string) => void
 }
 
+// ---------------------------------------------------------------------------
+// Fix 1: Persist tabId across page refreshes so the server can reuse the SSH session
+// ---------------------------------------------------------------------------
+function getOrCreateTabId(propTabId: string): string {
+  if (typeof window === 'undefined') return propTabId
+  const key = `ssh_tab_id_${propTabId}`
+  const stored = sessionStorage.getItem(key)
+  if (stored) return stored
+  sessionStorage.setItem(key, propTabId)
+  return propTabId
+}
+
+// ---------------------------------------------------------------------------
+// Fix 2: Exponential backoff helper
+// ---------------------------------------------------------------------------
+function backoffDelay(attempt: number): number {
+  // 1s → 2s → 4s → 8s → 16s, capped at 30s
+  return Math.min(1000 * Math.pow(2, attempt), 30000)
+}
+
+// ---------------------------------------------------------------------------
+// Fix 6: TextDecoder singleton for binary SSH output
+// ---------------------------------------------------------------------------
+const sshDecoder = new TextDecoder()
+
+// ---------------------------------------------------------------------------
+// Fix 7: Reconstruct VT100 escape sequences from a TerminalSnapshot
+// so Ghostty renders the exact terminal state (colors, cursor, TUI apps).
+// ---------------------------------------------------------------------------
+function snapshotToVT(snap: TerminalSnapshot): string {
+  const parts: string[] = []
+
+  // Clear screen and move to top-left
+  parts.push('\x1b[2J\x1b[H')
+
+  for (let r = 0; r < snap.lines.length; r++) {
+    const cells = snap.lines[r]
+    let col = 0
+
+    for (const cell of cells) {
+      if (cell.w === 0) continue  // wide char continuation
+
+      // Build SGR (Select Graphic Rendition) sequence
+      const sgr: number[] = [0]  // always reset first
+
+      // Attributes
+      if (cell.at & ATTR_BOLD)          sgr.push(1)
+      if (cell.at & ATTR_DIM)           sgr.push(2)
+      if (cell.at & ATTR_ITALIC)        sgr.push(3)
+      if (cell.at & ATTR_UNDERLINE)     sgr.push(4)
+      if (cell.at & ATTR_BLINK)         sgr.push(5)
+      if (cell.at & ATTR_INVERSE)       sgr.push(7)
+      if (cell.at & ATTR_INVISIBLE)     sgr.push(8)
+      if (cell.at & ATTR_STRIKETHROUGH) sgr.push(9)
+
+      // Foreground color
+      if (cell.fg >= 0) {
+        if (cell.fg < 8) {
+          sgr.push(30 + cell.fg)
+        } else if (cell.fg < 16) {
+          sgr.push(90 + (cell.fg - 8))
+        } else if (cell.fg < 256) {
+          sgr.push(38, 5, cell.fg)
+        } else {
+          // 24-bit RGB encoded as (r<<16|g<<8|b)
+          const r = (cell.fg >> 16) & 0xff
+          const g = (cell.fg >> 8)  & 0xff
+          const b =  cell.fg        & 0xff
+          sgr.push(38, 2, r, g, b)
+        }
+      }
+
+      // Background color
+      if (cell.bg >= 0) {
+        if (cell.bg < 8) {
+          sgr.push(40 + cell.bg)
+        } else if (cell.bg < 16) {
+          sgr.push(100 + (cell.bg - 8))
+        } else if (cell.bg < 256) {
+          sgr.push(48, 5, cell.bg)
+        } else {
+          const r = (cell.bg >> 16) & 0xff
+          const g = (cell.bg >> 8)  & 0xff
+          const b =  cell.bg        & 0xff
+          sgr.push(48, 2, r, g, b)
+        }
+      }
+
+      parts.push(`\x1b[${sgr.join(';')}m`)
+      parts.push(cell.ch)
+      col += cell.w
+    }
+
+    // Reset at end of each line, move to next line
+    parts.push('\x1b[0m')
+    if (r < snap.lines.length - 1) {
+      parts.push('\r\n')
+    }
+  }
+
+  // Reset all attributes
+  parts.push('\x1b[0m')
+
+  // Position cursor
+  parts.push(`\x1b[${snap.cursorY + 1};${snap.cursorX + 1}H`)
+
+  return parts.join('')
+}
+
 export default function Terminal({
-  tabId,
+  tabId: propTabId,
   host,
   port,
   username,
@@ -28,9 +154,16 @@ export default function Terminal({
   onDisconnected,
   onError,
 }: TerminalProps) {
-  const rendererRef = useRef<TerminalRendererHandle>(null)
-  const wsRef         = useRef<WebSocket | null>(null)
+  const rendererRef    = useRef<TerminalRendererHandle>(null)
+  const wsRef          = useRef<WebSocket | null>(null)
   const currentSizeRef = useRef({ cols: 0, rows: 0 })
+
+  // Fix 1: stable tabId that survives page refresh
+  const tabId = getOrCreateTabId(propTabId)
+
+  // Fix 2: show a manual reconnect button after max retries
+  const [showReconnectBtn, setShowReconnectBtn] = useState(false)
+  const reconnectFnRef = useRef<(() => void) | null>(null)
 
   // Stable refs for callbacks
   const onConnectedRef    = useRef(onConnected)
@@ -40,27 +173,45 @@ export default function Terminal({
   onDisconnectedRef.current = onDisconnected
   onErrorRef.current        = onError
 
-  // Config ref for reconnection (avoids re-running effect)
-  const configRef = useRef({ host, port, username, password, privateKey, passphrase })
-  configRef.current = { host, port, username, password, privateKey, passphrase }
-
-  // Output batching — accumulate SSH chunks, flush every 16ms (one frame)
-  // Prevents ghostty-web canvas from redrawing on every tiny SSH message
-  const outputBufferRef = useRef('')
-  const batchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Output batching — leading-edge flush for zero-latency echo, trailing batch for bursts.
+  //
+  // Strategy:
+  //   1. First chunk in a burst → flush immediately (0ms) so typed chars echo instantly
+  //   2. Any chunks arriving within the same rAF → batched into one render call
+  //   3. rAF fires (~16ms) → flush remaining buffered chunks
+  //
+  // This eliminates the 16ms echo delay while still coalescing rapid SSH output
+  // (e.g. `ls` output, vim redraws) into single canvas renders.
+  const outputBufferRef  = useRef<Uint8Array[]>([])
+  const batchRafRef      = useRef<number | null>(null)
 
   const flushOutput = () => {
-    batchTimeoutRef.current = null
-    const buf = outputBufferRef.current
-    if (!buf) return
-    outputBufferRef.current = ''
-    rendererRef.current?.write(buf, true)
+    batchRafRef.current = null
+    const chunks = outputBufferRef.current
+    if (chunks.length === 0) return
+    outputBufferRef.current = []
+    // Decode all accumulated binary chunks at once — preserves multi-byte sequences
+    const combined = new Uint8Array(chunks.reduce((acc, c) => acc + c.length, 0))
+    let offset = 0
+    for (const c of chunks) { combined.set(c, offset); offset += c.length }
+    const text = sshDecoder.decode(combined, { stream: true })
+    rendererRef.current?.write(text, true)
   }
 
-  const enqueueOutput = (chunk: string) => {
-    outputBufferRef.current += chunk
-    if (batchTimeoutRef.current === null) {
-      batchTimeoutRef.current = setTimeout(flushOutput, 16)
+  const enqueueOutput = (chunk: Uint8Array) => {
+    const isFirstChunk = outputBufferRef.current.length === 0
+    outputBufferRef.current.push(chunk)
+
+    if (isFirstChunk) {
+      // Flush immediately for zero-latency echo (typed char appears right away)
+      flushOutput()
+      // Schedule a rAF to catch any chunks that arrive in the same frame
+      if (batchRafRef.current === null) {
+        batchRafRef.current = requestAnimationFrame(flushOutput)
+      }
+    } else if (batchRafRef.current === null) {
+      // Already flushed the first chunk; batch the rest into next frame
+      batchRafRef.current = requestAnimationFrame(flushOutput)
     }
   }
 
@@ -68,98 +219,123 @@ export default function Terminal({
   // WebSocket connection effect
   // ---------------------------------------------------------------------------
   useEffect(() => {
-    let aborted       = false
-    let isConnecting  = true
+    let aborted      = false
+    let isConnecting = true
     let ws: WebSocket | null = null
     let pingInterval: ReturnType<typeof setInterval> | null = null
     let reconnectAttempts = 0
-    const MAX_RECONNECTS  = 5
 
     const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
     const wsUrl      = `${wsProtocol}//${window.location.host}/api/ssh`
 
-    const handleMessage = (event: MessageEvent) => {
+    // Fix 6: handle binary frames from server
+    const handleMessage = (event: MessageEvent<ArrayBuffer>) => {
       if (aborted) return
       try {
-        const msg = JSON.parse(event.data as string)
-        switch (msg.type) {
-          case 'connected':
+        const frame = decodeFrame(event.data)
+        if (!frame) { console.warn('[Terminal] malformed frame'); return }
+
+        switch (frame.type) {
+          case MsgType.CONNECTED:
             rendererRef.current?.write('\x1b[32mConnected!\x1b[0m\r\n\r\n')
             isConnecting = false
             reconnectAttempts = 0
+            setShowReconnectBtn(false)
             onConnectedRef.current?.()
             break
 
-          case 'replay':
-            // Full buffer replay — write all at once so the terminal lands in
-            // the exact visual state (text + cursor position) from before refresh
-            if (msg.data) {
-              rendererRef.current?.write(msg.data, true)
+          case MsgType.REPLAY:
+            // Full buffer replay — binary-safe, write all at once
+            if (frame.payload.length > 0) {
+              const text = sshDecoder.decode(frame.payload)
+              rendererRef.current?.write(text, true)
               rendererRef.current?.scrollToBottom()
             }
             break
 
-          case 'reconnected':
+          case MsgType.RECONNECTED:
             isConnecting = false
             reconnectAttempts = 0
+            setShowReconnectBtn(false)
             onConnectedRef.current?.()
-            // Tell the SSH server our actual terminal dimensions — the server
-            // no longer hardcodes 80x24 on reconnect, so we must send this
+            // Tell the SSH server our actual terminal dimensions
             {
               const { cols, rows } = currentSizeRef.current
               if (cols && rows && wsRef.current?.readyState === WebSocket.OPEN) {
-                wsRef.current.send(JSON.stringify({ type: 'resize', cols, rows }))
+                wsRef.current.send(encodeJsonFrame(MsgType.RESIZE, { cols, rows }))
               }
             }
             break
 
-          case 'data':
-            enqueueOutput(msg.data)
+          case MsgType.SSH_DATA:
+            // Fix 6: raw binary chunk — enqueue for batched decode
+            enqueueOutput(frame.payload.slice()) // slice to own the memory
             break
 
-          case 'error':
-            rendererRef.current?.write(`\x1b[31mError: ${msg.message}\x1b[0m\r\n`)
-            onErrorRef.current?.(msg.message)
+          case MsgType.ERROR: {
+            const { message } = decodeJsonPayload<{ message: string }>(frame.payload)
+            rendererRef.current?.write(`\x1b[31mError: ${message}\x1b[0m\r\n`)
+            onErrorRef.current?.(message)
             break
+          }
 
-          case 'disconnected':
+          case MsgType.SNAPSHOT: {
+            // Fix 7: exact terminal state from server's headless xterm
+            // Convert snapshot cells → VT100 escape sequences → feed to Ghostty
+            // This renders vim/htop/tmux correctly on reconnect, no raw replay mangling
+            const snap = decodeJsonPayload<TerminalSnapshot>(frame.payload)
+            const vt = snapshotToVT(snap)
+            rendererRef.current?.write(vt, false)  // false = don't auto-scroll (cursor is already positioned)
+            rendererRef.current?.scrollToBottom()
+            break
+          }
+
+          case MsgType.DISCONNECTED:
             rendererRef.current?.write('\x1b[33m\r\nDisconnected from server.\x1b[0m\r\n')
             onDisconnectedRef.current?.()
             break
         }
       } catch (err) {
-        console.error('[Terminal] message parse error:', err)
+        console.error('[Terminal] frame parse error:', err)
       }
     }
 
+    // Fix 2: exponential backoff reconnect with manual retry button after exhaustion
     const tryReconnect = () => {
       if (aborted) return
-      if (reconnectAttempts >= MAX_RECONNECTS) {
-        rendererRef.current?.write('\x1b[31mReconnection failed. Please reconnect manually.\x1b[0m\r\n')
+
+      const delay = backoffDelay(reconnectAttempts)
+      reconnectAttempts++
+
+      // After 5 attempts (~63s total), show the manual reconnect button
+      if (reconnectAttempts > 5) {
+        rendererRef.current?.write(
+          '\x1b[31mReconnection failed. Use the Reconnect button below.\x1b[0m\r\n'
+        )
+        setShowReconnectBtn(true)
         onDisconnectedRef.current?.()
         return
       }
 
-      reconnectAttempts++
       rendererRef.current?.write(
-        `\x1b[33mReconnecting (attempt ${reconnectAttempts}/${MAX_RECONNECTS})...\x1b[0m\r\n`
+        `\x1b[33mReconnecting in ${Math.round(delay / 1000)}s (attempt ${reconnectAttempts}/5)...\x1b[0m\r\n`
       )
 
       setTimeout(() => {
         if (aborted) return
         const newWs = new WebSocket(wsUrl)
+        newWs.binaryType = 'arraybuffer'
         wsRef.current = newWs
         ws = newWs
 
         newWs.onopen = () => {
-          // Send 'reconnect' so the server reuses the existing SSH session
-          // instead of opening a new one
-          newWs.send(JSON.stringify({ type: 'reconnect', tabId }))
+          if (aborted) { newWs.close(); return }
+          newWs.send(encodeJsonFrame(MsgType.RECONNECT, { tabId }))
         }
-        newWs.onmessage = (e) => handleMessage(e)
-        newWs.onerror   = () => tryReconnect()
-        newWs.onclose   = () => { if (reconnectAttempts < MAX_RECONNECTS) tryReconnect() }
-      }, 2000)
+        newWs.onmessage = (e) => handleMessage(e as MessageEvent<ArrayBuffer>)
+        newWs.onerror   = () => { if (!aborted) tryReconnect() }
+        newWs.onclose   = () => { if (!aborted && reconnectAttempts <= 5) tryReconnect() }
+      }, delay)
     }
 
     const connect = () => {
@@ -167,20 +343,21 @@ export default function Terminal({
       rendererRef.current?.write(`\x1b[33mConnecting to ${host}:${port}...\x1b[0m\r\n`)
 
       ws = new WebSocket(wsUrl)
+      // Fix 6: receive binary frames as ArrayBuffer
+      ws.binaryType = 'arraybuffer'
       wsRef.current = ws
 
       ws.onopen = () => {
-        // StrictMode cleanup may have already set aborted before we connected.
-        // Close the now-unwanted socket cleanly instead of sending into a dead effect.
         if (aborted) { ws!.close(); return }
-        ws!.send(JSON.stringify({
-          type: 'auth', tabId, host, port, username,
+        // Fix 6: send auth as binary frame with JSON payload
+        ws!.send(encodeJsonFrame(MsgType.AUTH, {
+          tabId, host, port, username,
           password, privateKey, passphrase,
         }))
       }
-      ws.onmessage = (e) => handleMessage(e)
+      ws.onmessage = (e) => handleMessage(e as MessageEvent<ArrayBuffer>)
       ws.onerror   = () => {
-        if (aborted) return  // StrictMode cleanup fires ws.close() mid-connect
+        if (aborted) return
         rendererRef.current?.write('\x1b[31mWebSocket error.\x1b[0m\r\n')
         onErrorRef.current?.('WebSocket connection failed')
       }
@@ -194,9 +371,18 @@ export default function Terminal({
       // Keepalive
       pingInterval = setInterval(() => {
         if (ws?.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'ping' }))
+          ws.send(encodeFrame(MsgType.PING))
         }
       }, 25000)
+    }
+
+    // Expose manual reconnect for the button
+    reconnectFnRef.current = () => {
+      if (aborted) return
+      reconnectAttempts = 0
+      setShowReconnectBtn(false)
+      rendererRef.current?.write('\x1b[33mManual reconnect...\x1b[0m\r\n')
+      connect()
     }
 
     connect()
@@ -204,15 +390,13 @@ export default function Terminal({
     return () => {
       aborted = true
       isConnecting = false
+      reconnectFnRef.current = null
       if (pingInterval) clearInterval(pingInterval)
-      if (batchTimeoutRef.current) {
-        clearTimeout(batchTimeoutRef.current)
-        batchTimeoutRef.current = null
+      if (batchRafRef.current !== null) {
+        cancelAnimationFrame(batchRafRef.current)
+        batchRafRef.current = null
       }
-      outputBufferRef.current = ''
-      // Only close OPEN sockets. If still CONNECTING, the onopen handler above
-      // will see `aborted` and close it — avoids the browser warning
-      // "WebSocket is closed before the connection is established".
+      outputBufferRef.current = []
       if (ws?.readyState === WebSocket.OPEN) {
         ws.close()
       }
@@ -225,23 +409,73 @@ export default function Terminal({
   // ---------------------------------------------------------------------------
   const handleData = (data: string) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: 'data', data }))
+      // Fix 6: encode keystrokes as raw binary DATA frame
+      const bytes = new TextEncoder().encode(data)
+      wsRef.current.send(encodeFrame(MsgType.DATA, bytes))
     }
   }
 
   const handleResize = (cols: number, rows: number) => {
     currentSizeRef.current = { cols, rows }
     if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: 'resize', cols, rows }))
+      wsRef.current.send(encodeJsonFrame(MsgType.RESIZE, { cols, rows }))
     }
   }
 
   return (
-    <TerminalRenderer
-      ref={rendererRef}
-      onData={handleData}
-      onResize={handleResize}
-      onTranscript={handleData}
-    />
+    <div style={{ position: 'relative', width: '100%', height: '100%' }}>
+      <TerminalRenderer
+        ref={rendererRef}
+        onData={handleData}
+        onResize={handleResize}
+        onTranscript={handleData}
+      />
+
+      {/* Fix 2: Manual reconnect button shown after exponential backoff exhausted */}
+      {showReconnectBtn && (
+        <div
+          style={{
+            position:       'absolute',
+            bottom:         48,
+            left:           '50%',
+            transform:      'translateX(-50%)',
+            zIndex:         30,
+            display:        'flex',
+            flexDirection:  'column',
+            alignItems:     'center',
+            gap:            8,
+          }}
+        >
+          <button
+            type="button"
+            onClick={() => reconnectFnRef.current?.()}
+            style={{
+              background:    '#ef4444',
+              color:         '#fff',
+              border:        'none',
+              borderRadius:  6,
+              padding:       '8px 20px',
+              fontFamily:    'ui-monospace, SFMono-Regular, "SF Mono", Consolas, monospace',
+              fontSize:      13,
+              fontWeight:    600,
+              cursor:        'pointer',
+              boxShadow:     '0 2px 8px rgba(0,0,0,0.3)',
+              letterSpacing: '0.02em',
+            }}
+          >
+            ↺ Reconnect
+          </button>
+          <span
+            style={{
+              color:      'rgba(255,255,255,0.55)',
+              fontSize:   11,
+              fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Consolas, monospace',
+            }}
+          >
+            Session may still be alive on the server
+          </span>
+        </div>
+      )}
+    </div>
   )
 }

@@ -23,6 +23,16 @@ body {
   padding: 8px;
 }
 
+/* Hide the browser's native blinking caret on ghostty-web's internal textarea.
+   ghostty-web mounts a 1×1 opacity-0 textarea at position (0,0) of the canvas
+   for keyboard capture. The browser still renders its blinking insertion caret
+   there, producing a phantom cursor at the top-left of the terminal.
+   Setting caret-color: transparent removes it without affecting functionality. */
+#terminal-container textarea {
+  caret-color: transparent !important;
+}
+
+
 /* Mobile touch improvements */
 @media (pointer: coarse) {
   .xterm-viewport {

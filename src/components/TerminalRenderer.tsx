@@ -288,7 +288,7 @@ const TerminalRenderer = forwardRef<TerminalRendererHandle, TerminalRendererProp
     // -----------------------------------------------------------------------
     return (
       <div
-        style={{ position: 'absolute', inset: 0, backgroundColor: bgColor }}
+        style={{ position: 'absolute', inset: 0, backgroundColor: bgColor, padding: '10px 14px', boxSizing: 'border-box' }}
         onPaste={handlePaste}
       >
         {/* Hidden textarea for native paste capture (vibetunnel pattern) */}

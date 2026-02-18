@@ -18,6 +18,10 @@ const handle = app.getRequestHandler()
 // Session persistence config
 const SESSION_TIMEOUT_MS = 300000 // 5 minutes to reconnect
 
+// Rolling output buffer per session — stores raw SSH bytes so we can replay
+// them on reconnect, restoring the terminal to its exact visual state.
+const MAX_OUTPUT_BUFFER = 200 * 1024 // 200 KB
+
 // SSH connection sessions map (tabId -> { conn, stream, ws, lastActivity })
 const sessions = new Map()
 
@@ -99,13 +103,7 @@ app.prepare().then(() => {
             } else {
               // Create new session
               console.log(`Creating new session for ${sessionKey}`)
-              handleAuth(ws, msg, (conn, stream) => {
-                const session = { 
-                  conn, 
-                  stream, 
-                  ws, 
-                  lastActivity: Date.now() 
-                }
+              handleAuth(ws, msg, (session) => {
                 sessions.set(sessionKey, session)
               })
             }
@@ -192,21 +190,32 @@ app.prepare().then(() => {
  */
 function attachToSession(ws, tabId, session) {
   const { conn, stream } = session
-  
+
   // Update session with new WebSocket
   session.ws = ws
   session.lastActivity = Date.now()
 
-  // Send reconnected message
+  // Replay the stored output buffer first — this restores the terminal to its
+  // exact visual state (text, colors, cursor position) before the reconnect.
+  if (session.outputBuffer) {
+    ws.send(JSON.stringify({ type: 'replay', data: session.outputBuffer }))
+  }
+
+  // Then signal reconnect (client shows "Reconnected!" banner)
   ws.send(JSON.stringify({ type: 'reconnected' }))
 
-  // Pipe SSH output to new WebSocket
+  // Pipe SSH output to the new WebSocket and keep the buffer updated
   const dataHandler = (data) => {
+    const text = data.toString('utf-8')
+    session.outputBuffer += text
+    if (session.outputBuffer.length > MAX_OUTPUT_BUFFER) {
+      session.outputBuffer = session.outputBuffer.slice(-MAX_OUTPUT_BUFFER)
+    }
     if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'data', data: data.toString('utf-8') }))
+      ws.send(JSON.stringify({ type: 'data', data: text }))
     }
   }
-  
+
   stream.on('data', dataHandler)
 
   // Handle stream close
@@ -279,16 +288,31 @@ function handleAuth(ws, msg, onReady) {
 
         console.log('Shell opened')
 
-        // Pipe SSH output to WebSocket
+        // Build the session object first so the data handler can write into it
+        const session = { conn, stream, ws, lastActivity: Date.now(), outputBuffer: '' }
+
+        const appendToBuffer = (text) => {
+          session.outputBuffer += text
+          if (session.outputBuffer.length > MAX_OUTPUT_BUFFER) {
+            // Trim from the front, keeping the most recent output
+            session.outputBuffer = session.outputBuffer.slice(-MAX_OUTPUT_BUFFER)
+          }
+        }
+
+        // Pipe SSH output to WebSocket and into the rolling buffer
         stream.on('data', (data) => {
+          const text = data.toString('utf-8')
+          appendToBuffer(text)
           if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'data', data: data.toString('utf-8') }))
+            ws.send(JSON.stringify({ type: 'data', data: text }))
           }
         })
 
         stream.on('close', () => {
           console.log('Stream closed')
-          ws.send(JSON.stringify({ type: 'disconnected' }))
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'disconnected' }))
+          }
           if (tabId) {
             sessions.delete(tabId)
           }
@@ -296,15 +320,17 @@ function handleAuth(ws, msg, onReady) {
         })
 
         stream.stderr.on('data', (data) => {
+          const text = data.toString('utf-8')
+          appendToBuffer(text)
           if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'data', data: data.toString('utf-8') }))
+            ws.send(JSON.stringify({ type: 'data', data: text }))
           }
         })
 
         // Notify client that connection is ready
         ws.send(JSON.stringify({ type: 'connected' }))
 
-        onReady(conn, stream)
+        onReady(session)
       }
     )
   })

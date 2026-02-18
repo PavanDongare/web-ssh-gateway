@@ -1,9 +1,7 @@
 'use client'
 
 import { useEffect, useRef } from 'react'
-import { Terminal as XTerm } from '@xterm/xterm'
-import { FitAddon } from '@xterm/addon-fit'
-import '@xterm/xterm/css/xterm.css'
+import TerminalRenderer, { type TerminalRendererHandle } from './TerminalRenderer'
 
 interface TerminalProps {
   tabId: string
@@ -30,233 +28,201 @@ export default function Terminal({
   onDisconnected,
   onError,
 }: TerminalProps) {
-  const containerRef = useRef<HTMLDivElement>(null)
-  const terminalRef = useRef<XTerm | null>(null)
-  const fitAddonRef = useRef<FitAddon | null>(null)
-  const wsRef = useRef<WebSocket | null>(null)
-  
-  const mountCountRef = useRef(0)
-  const isConnectingRef = useRef(false)
-  
-  const configRef = useRef({ host, port, username, password, privateKey, passphrase })
+  const rendererRef = useRef<TerminalRendererHandle>(null)
+  const wsRef       = useRef<WebSocket | null>(null)
 
-  const onConnectedRef = useRef(onConnected)
+  // Stable refs for callbacks
+  const onConnectedRef    = useRef(onConnected)
   const onDisconnectedRef = useRef(onDisconnected)
-  const onErrorRef = useRef(onError)
-
-  onConnectedRef.current = onConnected
+  const onErrorRef        = useRef(onError)
+  onConnectedRef.current    = onConnected
   onDisconnectedRef.current = onDisconnected
-  onErrorRef.current = onError
+  onErrorRef.current        = onError
 
+  // Config ref for reconnection (avoids re-running effect)
+  const configRef = useRef({ host, port, username, password, privateKey, passphrase })
+  configRef.current = { host, port, username, password, privateKey, passphrase }
+
+  // Output batching — accumulate SSH chunks, flush every 16ms (one frame)
+  // Prevents ghostty-web canvas from redrawing on every tiny SSH message
+  const outputBufferRef = useRef('')
+  const batchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const flushOutput = () => {
+    batchTimeoutRef.current = null
+    const buf = outputBufferRef.current
+    if (!buf) return
+    outputBufferRef.current = ''
+    rendererRef.current?.write(buf, true)
+  }
+
+  const enqueueOutput = (chunk: string) => {
+    outputBufferRef.current += chunk
+    if (batchTimeoutRef.current === null) {
+      batchTimeoutRef.current = setTimeout(flushOutput, 16)
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // WebSocket connection effect
+  // ---------------------------------------------------------------------------
   useEffect(() => {
-    mountCountRef.current++
-    console.log('[Terminal] useEffect run #' + mountCountRef.current)
-    
-    if (mountCountRef.current < 2) {
-      console.log('[Terminal] Skipping - StrictMode mount #' + mountCountRef.current)
-      return
-    }
-    
-    if (!containerRef.current) {
-      console.log('[Terminal] Skipping - no container')
-      return
-    }
-    
-    isConnectingRef.current = true
-    console.log('[Terminal] Creating terminal for', host, port, username)
-
-    const terminal = new XTerm({
-      cursorBlink: true,
-      fontSize: 14,
-      fontFamily: 'Menlo, Monaco, "Courier New", monospace',
-      theme: {
-        background: '#1a1a2e',
-        foreground: '#eaeaea',
-        cursor: '#ffffff',
-        cursorAccent: '#1a1a2e',
-      },
-    })
-
-    const fitAddon = new FitAddon()
-    terminal.loadAddon(fitAddon)
-    terminal.open(containerRef.current)
-    fitAddon.fit()
-
-    terminalRef.current = terminal
-    fitAddonRef.current = fitAddon
-
-    terminal.writeln(`\x1b[33mConnecting to ${host}:${port}...\x1b[0m`)
+    let aborted       = false
+    let isConnecting  = true
+    let ws: WebSocket | null = null
+    let pingInterval: ReturnType<typeof setInterval> | null = null
+    let reconnectAttempts = 0
+    const MAX_RECONNECTS  = 5
 
     const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const wsUrl = `${wsProtocol}//${window.location.host}/api/ssh`
-    const ws = new WebSocket(wsUrl)
-    wsRef.current = ws
+    const wsUrl      = `${wsProtocol}//${window.location.host}/api/ssh`
 
-    ws.onopen = () => {
-      ws.send(JSON.stringify({
-        type: 'auth',
-        tabId,
-        host,
-        port,
-        username,
-        password,
-        privateKey,
-        passphrase,
-      }))
-    }
-
-    ws.onmessage = (event) => {
+    const handleMessage = (event: MessageEvent) => {
+      if (aborted) return
       try {
-        const msg = JSON.parse(event.data)
+        const msg = JSON.parse(event.data as string)
         switch (msg.type) {
           case 'connected':
-            terminal.writeln('\x1b[32mConnected!\x1b[0m')
-            terminal.writeln('')
-            isConnectingRef.current = false
+            rendererRef.current?.write('\x1b[32mConnected!\x1b[0m\r\n\r\n')
+            isConnecting = false
+            reconnectAttempts = 0
             onConnectedRef.current?.()
             break
+
+          case 'replay':
+            // Full buffer replay — write all at once so the terminal lands in
+            // the exact visual state (text + cursor position) from before refresh
+            if (msg.data) {
+              rendererRef.current?.write(msg.data, true)
+              rendererRef.current?.scrollToBottom()
+            }
+            break
+
           case 'reconnected':
-            terminal.writeln('\x1b[32mReconnected!\x1b[0m')
-            isConnectingRef.current = false
+            // Replay already rendered state — just resume
+            isConnecting = false
+            reconnectAttempts = 0
             onConnectedRef.current?.()
             break
+
           case 'data':
-            terminal.write(msg.data)
+            enqueueOutput(msg.data)
             break
+
           case 'error':
-            terminal.writeln(`\x1b[31mError: ${msg.message}\x1b[0m`)
+            rendererRef.current?.write(`\x1b[31mError: ${msg.message}\x1b[0m\r\n`)
             onErrorRef.current?.(msg.message)
             break
+
           case 'disconnected':
-            terminal.writeln('\x1b[33m\r\nDisconnected from server.\x1b[0m')
+            rendererRef.current?.write('\x1b[33m\r\nDisconnected from server.\x1b[0m\r\n')
             onDisconnectedRef.current?.()
             break
         }
       } catch (err) {
-        console.error('Error parsing message:', err)
+        console.error('[Terminal] message parse error:', err)
       }
     }
 
-    ws.onerror = () => {
-      terminal.writeln('\x1b[31mWebSocket error.\x1b[0m')
-      onErrorRef.current?.('WebSocket connection failed')
-    }
-
-    let reconnectAttempts = 0
-    const maxReconnectAttempts = 5
-
-    ws.onclose = () => {
-      if (!isConnectingRef.current) {
-        terminal.writeln('\x1b[33m\r\nConnection lost. Attempting to reconnect...\x1b[0m')
-        tryReconnect(terminal, configRef.current, tabId)
-      }
-    }
-
-    async function tryReconnect(term: XTerm, config: typeof configRef.current, id: string) {
-      if (reconnectAttempts >= maxReconnectAttempts) {
-        term.writeln('\x1b[31mReconnection failed. Please reconnect manually.\x1b[0m')
+    const tryReconnect = () => {
+      if (aborted) return
+      if (reconnectAttempts >= MAX_RECONNECTS) {
+        rendererRef.current?.write('\x1b[31mReconnection failed. Please reconnect manually.\x1b[0m\r\n')
         onDisconnectedRef.current?.()
         return
       }
 
       reconnectAttempts++
-      term.writeln(`\x1b[33mReconnecting (attempt ${reconnectAttempts}/${maxReconnectAttempts})...\x1b[0m`)
+      rendererRef.current?.write(
+        `\x1b[33mReconnecting (attempt ${reconnectAttempts}/${MAX_RECONNECTS})...\x1b[0m\r\n`
+      )
 
-      await new Promise(resolve => setTimeout(resolve, 2000))
-
-      try {
+      setTimeout(() => {
+        if (aborted) return
         const newWs = new WebSocket(wsUrl)
-        
+        wsRef.current = newWs
+        ws = newWs
+
         newWs.onopen = () => {
-          newWs.send(JSON.stringify({
-            type: 'auth',
-            tabId: id,
-            ...config
-          }))
+          newWs.send(JSON.stringify({ type: 'auth', tabId, ...configRef.current }))
         }
-
-        newWs.onmessage = (event) => {
-          try {
-            const msg = JSON.parse(event.data)
-            if (msg.type === 'reconnected' || msg.type === 'connected') {
-              term.writeln('\x1b[32mReconnected!\x1b[0m')
-              reconnectAttempts = 0
-              wsRef.current = newWs
-            } else if (msg.type === 'data') {
-              term.write(msg.data)
-            } else if (msg.type === 'error') {
-              term.writeln(`\x1b[31mError: ${msg.message}\x1b[0m`)
-            }
-          } catch (err) {
-            console.error('Error parsing message:', err)
-          }
-        }
-
-        newWs.onerror = () => {
-          tryReconnect(term, config, id)
-        }
-
-        newWs.onclose = () => {
-          if (reconnectAttempts < maxReconnectAttempts) {
-            tryReconnect(term, config, id)
-          }
-        }
-      } catch (err) {
-        tryReconnect(term, config, id)
-      }
+        newWs.onmessage = (e) => handleMessage(e)
+        newWs.onerror   = () => tryReconnect()
+        newWs.onclose   = () => { if (reconnectAttempts < MAX_RECONNECTS) tryReconnect() }
+      }, 2000)
     }
 
-    terminal.onData((data) => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'data', data }))
-      }
-    })
+    const connect = () => {
+      if (aborted) return
+      rendererRef.current?.write(`\x1b[33mConnecting to ${host}:${port}...\x1b[0m\r\n`)
 
-    const handleResize = () => {
-      if (fitAddonRef.current && terminalRef.current) {
-        fitAddonRef.current.fit()
-        const dims = fitAddonRef.current.proposeDimensions()
-        if (ws.readyState === WebSocket.OPEN && dims) {
-          ws.send(JSON.stringify({
-            type: 'resize',
-            cols: dims.cols,
-            rows: dims.rows,
-          }))
+      ws = new WebSocket(wsUrl)
+      wsRef.current = ws
+
+      ws.onopen = () => {
+        ws!.send(JSON.stringify({
+          type: 'auth', tabId, host, port, username,
+          password, privateKey, passphrase,
+        }))
+      }
+      ws.onmessage = (e) => handleMessage(e)
+      ws.onerror   = () => {
+        rendererRef.current?.write('\x1b[31mWebSocket error.\x1b[0m\r\n')
+        onErrorRef.current?.('WebSocket connection failed')
+      }
+      ws.onclose = () => {
+        if (!isConnecting && !aborted) {
+          rendererRef.current?.write('\x1b[33m\r\nConnection lost. Attempting to reconnect...\x1b[0m\r\n')
+          tryReconnect()
         }
       }
+
+      // Keepalive
+      pingInterval = setInterval(() => {
+        if (ws?.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'ping' }))
+        }
+      }, 25000)
     }
 
-    window.addEventListener('resize', handleResize)
-    setTimeout(handleResize, 100)
-
-    // Keep WebSocket alive with periodic pings
-    const pingInterval = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'ping' }))
-      }
-    }, 25000) // Ping every 25 seconds
+    connect()
 
     return () => {
-      clearInterval(pingInterval)
-      window.removeEventListener('resize', handleResize)
-      
-      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+      aborted = true
+      isConnecting = false
+      if (pingInterval) clearInterval(pingInterval)
+      if (batchTimeoutRef.current) {
+        clearTimeout(batchTimeoutRef.current)
+        batchTimeoutRef.current = null
+      }
+      outputBufferRef.current = ''
+      if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) {
         ws.close()
       }
-      
-      terminal.dispose()
-      
-      terminalRef.current = null
-      fitAddonRef.current = null
       wsRef.current = null
     }
-  }, [tabId, host, port, username, password, privateKey, passphrase])
+  }, [tabId, host, port, username]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ---------------------------------------------------------------------------
+  // Send keystrokes and resize to SSH server
+  // ---------------------------------------------------------------------------
+  const handleData = (data: string) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'data', data }))
+    }
+  }
+
+  const handleResize = (cols: number, rows: number) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'resize', cols, rows }))
+    }
+  }
 
   return (
-    <div
-      ref={containerRef}
-      className="h-full w-full bg-[#1a1a2e] rounded-lg overflow-hidden"
-      style={{ minHeight: '400px' }}
+    <TerminalRenderer
+      ref={rendererRef}
+      onData={handleData}
+      onResize={handleResize}
     />
   )
 }

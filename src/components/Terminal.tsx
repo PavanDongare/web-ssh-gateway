@@ -232,7 +232,8 @@ export default function Terminal({
 
         switch (frame.type) {
           case MsgType.CONNECTED:
-            rendererRef.current?.write('\x1b[32mConnected!\x1b[0m\r\n\r\n')
+            // Erase the "Connecting to …" line so it doesn't linger on success
+            rendererRef.current?.write('\x1b[2K\x1b[1A\x1b[2K\x1b[G')
             isConnecting = false
             reconnectAttempts = 0
             setShowReconnectBtn(false)
@@ -335,7 +336,6 @@ export default function Terminal({
 
     const connect = () => {
       if (aborted) return
-      rendererRef.current?.write(`\x1b[33mConnecting to ${host}:${port}...\x1b[0m\r\n`)
 
       ws = new WebSocket(wsUrl)
       // Fix 6: receive binary frames as ArrayBuffer
@@ -344,6 +344,9 @@ export default function Terminal({
 
       ws.onopen = () => {
         if (aborted) { ws!.close(); return }
+        // Write "Connecting…" only once the socket is actually open (avoids
+        // StrictMode double-mount writing it twice in development).
+        rendererRef.current?.write(`\x1b[33mConnecting to ${host}:${port}...\x1b[0m\r\n`)
         // Fix 6: send auth as binary frame with JSON payload
         ws!.send(encodeJsonFrame(MsgType.AUTH, {
           tabId, host, port, username,

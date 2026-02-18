@@ -29,7 +29,8 @@ export default function Terminal({
   onError,
 }: TerminalProps) {
   const rendererRef = useRef<TerminalRendererHandle>(null)
-  const wsRef       = useRef<WebSocket | null>(null)
+  const wsRef         = useRef<WebSocket | null>(null)
+  const currentSizeRef = useRef({ cols: 0, rows: 0 })
 
   // Stable refs for callbacks
   const onConnectedRef    = useRef(onConnected)
@@ -99,10 +100,17 @@ export default function Terminal({
             break
 
           case 'reconnected':
-            // Replay already rendered state — just resume
             isConnecting = false
             reconnectAttempts = 0
             onConnectedRef.current?.()
+            // Tell the SSH server our actual terminal dimensions — the server
+            // no longer hardcodes 80x24 on reconnect, so we must send this
+            {
+              const { cols, rows } = currentSizeRef.current
+              if (cols && rows && wsRef.current?.readyState === WebSocket.OPEN) {
+                wsRef.current.send(JSON.stringify({ type: 'resize', cols, rows }))
+              }
+            }
             break
 
           case 'data':
@@ -144,7 +152,9 @@ export default function Terminal({
         ws = newWs
 
         newWs.onopen = () => {
-          newWs.send(JSON.stringify({ type: 'auth', tabId, ...configRef.current }))
+          // Send 'reconnect' so the server reuses the existing SSH session
+          // instead of opening a new one
+          newWs.send(JSON.stringify({ type: 'reconnect', tabId }))
         }
         newWs.onmessage = (e) => handleMessage(e)
         newWs.onerror   = () => tryReconnect()
@@ -160,6 +170,9 @@ export default function Terminal({
       wsRef.current = ws
 
       ws.onopen = () => {
+        // StrictMode cleanup may have already set aborted before we connected.
+        // Close the now-unwanted socket cleanly instead of sending into a dead effect.
+        if (aborted) { ws!.close(); return }
         ws!.send(JSON.stringify({
           type: 'auth', tabId, host, port, username,
           password, privateKey, passphrase,
@@ -167,6 +180,7 @@ export default function Terminal({
       }
       ws.onmessage = (e) => handleMessage(e)
       ws.onerror   = () => {
+        if (aborted) return  // StrictMode cleanup fires ws.close() mid-connect
         rendererRef.current?.write('\x1b[31mWebSocket error.\x1b[0m\r\n')
         onErrorRef.current?.('WebSocket connection failed')
       }
@@ -196,7 +210,10 @@ export default function Terminal({
         batchTimeoutRef.current = null
       }
       outputBufferRef.current = ''
-      if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) {
+      // Only close OPEN sockets. If still CONNECTING, the onopen handler above
+      // will see `aborted` and close it — avoids the browser warning
+      // "WebSocket is closed before the connection is established".
+      if (ws?.readyState === WebSocket.OPEN) {
         ws.close()
       }
       wsRef.current = null
@@ -213,6 +230,7 @@ export default function Terminal({
   }
 
   const handleResize = (cols: number, rows: number) => {
+    currentSizeRef.current = { cols, rows }
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type: 'resize', cols, rows }))
     }

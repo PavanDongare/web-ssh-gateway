@@ -38,7 +38,7 @@ setInterval(() => {
   }
 }, 30000)
 
-app.prepare().then(() => {
+app.prepare().then(async () => {
   const server = createServer(async (req, res) => {
     try {
       const parsedUrl = parse(req.url, true)
@@ -50,11 +50,23 @@ app.prepare().then(() => {
     }
   })
 
-  // WebSocket server for terminal sessions
-  const wss = new WebSocket.Server({ 
-    server, 
-    path: '/api/ssh',
-    clientTracking: true 
+  const wss = new WebSocket.Server({ noServer: true, clientTracking: true })
+
+  // Next.js 13.1+ exposes getUpgradeHandler() so its HMR WebSocket
+  // (/_next/webpack-hmr) works correctly with a custom server.
+  // Without this, HMR upgrade requests have no handler and retry forever.
+  const nextUpgradeHandler = await app.getUpgradeHandler()
+
+  server.on('upgrade', (req, socket, head) => {
+    const { pathname } = parse(req.url)
+    if (pathname === '/api/ssh') {
+      wss.handleUpgrade(req, socket, head, (client) => {
+        wss.emit('connection', client, req)
+      })
+    } else {
+      // Let Next.js handle HMR and any other internal WebSocket upgrades
+      nextUpgradeHandler(req, socket, head)
+    }
   })
 
   // Heartbeat to keep connections alive - ping every 30 seconds
@@ -90,23 +102,14 @@ app.prepare().then(() => {
 
         switch (msg.type) {
           case 'auth':
-            // Use host+username as session key (not tabId) for reconnection
-            const sessionKey = `${msg.username}@${msg.host}`
-            tabId = sessionKey
-            
-            // Check if session already exists
-            const existingSession = sessions.get(sessionKey)
-            if (existingSession && existingSession.conn) {
-              console.log(`Reconnecting to existing session ${sessionKey}`)
-              // Reattach to existing session
-              attachToSession(ws, sessionKey, existingSession)
-            } else {
-              // Create new session
-              console.log(`Creating new session for ${sessionKey}`)
-              handleAuth(ws, msg, (session) => {
-                sessions.set(sessionKey, session)
-              })
-            }
+            // Each tab gets its own session — tabId is the unique key
+            tabId = msg.tabId
+
+            // Create new session
+            console.log(`Creating new session for tab ${tabId} (${msg.username}@${msg.host})`)
+            handleAuth(ws, msg, (session) => {
+              sessions.set(tabId, session)
+            })
             break
 
           case 'reconnect':
@@ -115,8 +118,6 @@ app.prepare().then(() => {
             const session = sessions.get(tabId)
             if (session && session.conn) {
               console.log(`Reconnecting to session ${tabId}`)
-              session.ws = ws  // Update WebSocket reference
-              session.lastActivity = Date.now()
               attachToSession(ws, tabId, session)
             } else {
               ws.send(JSON.stringify({ 
@@ -186,54 +187,28 @@ app.prepare().then(() => {
 })
 
 /**
- * Attach WebSocket to existing SSH session
+ * Attach a new WebSocket to an existing SSH session.
+ *
+ * The data/close/stderr handlers set up in handleAuth already reference
+ * session.ws, so just swapping that pointer is enough — no new listeners
+ * needed, no listener accumulation across reconnects.
+ *
+ * The client is expected to send a 'resize' message immediately after
+ * receiving 'reconnected', which will call stream.setWindow with the
+ * actual current terminal dimensions.
  */
 function attachToSession(ws, tabId, session) {
-  const { conn, stream } = session
-
-  // Update session with new WebSocket
   session.ws = ws
   session.lastActivity = Date.now()
 
-  // Replay the stored output buffer first — this restores the terminal to its
-  // exact visual state (text, colors, cursor position) before the reconnect.
+  // Replay buffered output so the terminal shows its current visual state
   if (session.outputBuffer) {
     ws.send(JSON.stringify({ type: 'replay', data: session.outputBuffer }))
   }
 
-  // Then signal reconnect (client shows "Reconnected!" banner)
+  // Signal reconnect — client will respond with a 'resize' message
   ws.send(JSON.stringify({ type: 'reconnected' }))
 
-  // Pipe SSH output to the new WebSocket and keep the buffer updated
-  const dataHandler = (data) => {
-    const text = data.toString('utf-8')
-    session.outputBuffer += text
-    if (session.outputBuffer.length > MAX_OUTPUT_BUFFER) {
-      session.outputBuffer = session.outputBuffer.slice(-MAX_OUTPUT_BUFFER)
-    }
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'data', data: text }))
-    }
-  }
-
-  stream.on('data', dataHandler)
-
-  // Handle stream close
-  stream.on('close', () => {
-    ws.send(JSON.stringify({ type: 'disconnected' }))
-    sessions.delete(tabId)
-  })
-
-  // Handle stderr
-  stream.stderr.on('data', (data) => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'data', data: data.toString('utf-8') }))
-    }
-  })
-
-  // Send initial resize
-  stream.setWindow(80, 24)
-  
   console.log(`Reattached WebSocket to session ${tabId}`)
 }
 
@@ -254,6 +229,9 @@ function handleAuth(ws, msg, onReady) {
   }
 
   const conn = new ssh2.Client()
+  // Hoisted so conn.on('close') can reference the same session object
+  // as the stream handlers set up inside conn.on('ready').
+  let session = null
 
   const config = {
     host,
@@ -288,8 +266,8 @@ function handleAuth(ws, msg, onReady) {
 
         console.log('Shell opened')
 
-        // Build the session object first so the data handler can write into it
-        const session = { conn, stream, ws, lastActivity: Date.now(), outputBuffer: '' }
+        // Assign to the hoisted let so conn.on('close') can see it too
+        session = { conn, stream, ws, lastActivity: Date.now(), outputBuffer: '' }
 
         const appendToBuffer = (text) => {
           session.outputBuffer += text
@@ -299,32 +277,47 @@ function handleAuth(ws, msg, onReady) {
           }
         }
 
-        // Pipe SSH output to WebSocket and into the rolling buffer
+        // Server-side output batching — accumulate SSH chunks for up to 10ms
+        // before sending over WebSocket. SSH can produce hundreds of tiny
+        // writes per second (e.g. ls output); batching them reduces WebSocket
+        // frame overhead significantly without adding perceptible latency.
+        let batchBuf = ''
+        let batchTimer = null
+        const flushBatch = () => {
+          batchTimer = null
+          if (!batchBuf) return
+          const text = batchBuf
+          batchBuf = ''
+          if (session.ws?.readyState === WebSocket.OPEN) {
+            session.ws.send(JSON.stringify({ type: 'data', data: text }))
+          }
+        }
+
+        // Pipe SSH output to WebSocket and into the rolling buffer.
+        // Use session.ws (not the closed-over ws) so reconnects automatically
+        // route to the new WebSocket without adding a second handler.
         stream.on('data', (data) => {
           const text = data.toString('utf-8')
           appendToBuffer(text)
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'data', data: text }))
-          }
+          batchBuf += text
+          if (!batchTimer) batchTimer = setTimeout(flushBatch, 10)
         })
 
         stream.on('close', () => {
           console.log('Stream closed')
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'disconnected' }))
+          if (batchTimer) { clearTimeout(batchTimer); batchTimer = null }
+          if (session.ws?.readyState === WebSocket.OPEN) {
+            session.ws.send(JSON.stringify({ type: 'disconnected' }))
           }
-          if (tabId) {
-            sessions.delete(tabId)
-          }
+          sessions.delete(tabId)
           conn.end()
         })
 
         stream.stderr.on('data', (data) => {
           const text = data.toString('utf-8')
           appendToBuffer(text)
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'data', data: text }))
-          }
+          batchBuf += text
+          if (!batchTimer) batchTimer = setTimeout(flushBatch, 10)
         })
 
         // Notify client that connection is ready
@@ -342,12 +335,10 @@ function handleAuth(ws, msg, onReady) {
 
   conn.on('close', () => {
     console.log('SSH connection closed')
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'disconnected' }))
+    if (session?.ws?.readyState === WebSocket.OPEN) {
+      session.ws.send(JSON.stringify({ type: 'disconnected' }))
     }
-    if (tabId) {
-      sessions.delete(tabId)
-    }
+    sessions.delete(tabId)
   })
 
   // Initiate connection

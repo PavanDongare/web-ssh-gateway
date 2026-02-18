@@ -150,28 +150,23 @@ export default function Home() {
         <div className="bg-gray-800 border-b border-gray-700 px-4 py-2 flex items-center gap-2 overflow-x-auto">
           <span className="text-xs text-gray-400 whitespace-nowrap">Saved:</span>
           {savedConnections.map((conn, idx) => (
-            <button
-              key={idx}
-              onClick={() => {
-                // Check if already connected
-                const exists = tabs.some(t => t.host === conn.host && t.username === conn.username)
-                if (!exists) {
-                  handleConnect(conn)
-                }
-              }}
-              className="px-3 py-1 bg-gray-700 text-gray-300 text-xs rounded-full hover:bg-gray-600 whitespace-nowrap flex items-center gap-1"
-            >
-              {conn.username}@{conn.host}
+            <div key={idx} className="flex items-center bg-gray-700 rounded-full">
               <button
-                onClick={(e) => {
-                  e.stopPropagation()
-                  handleDeleteConnection(conn)
+                onClick={() => {
+                  const exists = tabs.some(t => t.host === conn.host && t.username === conn.username)
+                  if (!exists) handleConnect(conn)
                 }}
-                className="ml-1 text-gray-500 hover:text-red-400"
+                className="px-3 py-1 text-gray-300 text-xs hover:text-white whitespace-nowrap"
+              >
+                {conn.username}@{conn.host}
+              </button>
+              <button
+                onClick={() => handleDeleteConnection(conn)}
+                className="pr-2 text-gray-500 hover:text-red-400 text-xs"
               >
                 ×
               </button>
-            </button>
+            </div>
           ))}
         </div>
       )}

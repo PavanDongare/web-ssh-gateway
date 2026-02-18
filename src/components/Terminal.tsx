@@ -241,6 +241,7 @@ export default function Terminal({
       ref={rendererRef}
       onData={handleData}
       onResize={handleResize}
+      onTranscript={handleData}
     />
   )
 }

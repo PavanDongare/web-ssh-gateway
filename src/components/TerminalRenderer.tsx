@@ -30,6 +30,7 @@ import { Ghostty, FitAddon, Terminal as GhosttyTerminal } from 'ghostty-web'
 import { TERMINAL_FONT_FAMILY } from '@/utils/terminal-constants'
 import { getThemeColors } from '@/utils/terminal-themes'
 import { TerminalPreferencesManager } from '@/utils/terminal-preferences'
+import VoiceInput from './VoiceInput'
 
 // ---------------------------------------------------------------------------
 // ghostty-web singleton — identical to vibetunnel's ensureGhostty()
@@ -60,13 +61,15 @@ interface TerminalRendererProps {
   onResize: (cols: number, rows: number) => void
   /** Called once the terminal canvas is mounted and ready */
   onReady?: () => void
+  /** Called with transcribed voice text — same path as keyboard input */
+  onTranscript?: (text: string) => void
 }
 
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
 const TerminalRenderer = forwardRef<TerminalRendererHandle, TerminalRendererProps>(
-  function TerminalRenderer({ onData, onResize, onReady }, ref) {
+  function TerminalRenderer({ onData, onResize, onReady, onTranscript }, ref) {
     const containerRef = useRef<HTMLDivElement>(null)
     const termRef      = useRef<GhosttyTerminal | null>(null)
     const fitRef       = useRef<FitAddon | null>(null)
@@ -321,6 +324,11 @@ const TerminalRenderer = forwardRef<TerminalRendererHandle, TerminalRendererProp
             userSelect:           'text',
           }}
         />
+
+        {/* Voice input button */}
+        {onTranscript && (
+          <VoiceInput onTranscript={onTranscript} />
+        )}
 
         {/* Scroll-to-bottom button (vibetunnel pattern) */}
         {showScrollBtn && (

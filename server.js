@@ -208,7 +208,9 @@ app.prepare().then(async () => {
     }
   })
 
-  const wss = new WebSocket.Server({ noServer: true, clientTracking: true })
+  // perMessageDeflate: false — SSH data is already binary/uncompressable.
+  // Disabling saves CPU on every frame without any bandwidth cost.
+  const wss = new WebSocket.Server({ noServer: true, clientTracking: true, perMessageDeflate: false })
 
   // Next.js 13.1+ exposes getUpgradeHandler() so its HMR WebSocket works correctly
   const nextUpgradeHandler = await app.getUpgradeHandler()

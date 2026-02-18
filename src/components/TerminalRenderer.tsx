@@ -29,6 +29,7 @@ import {
   useCallback,
   useEffect,
   useImperativeHandle,
+  useMemo,
   useRef,
   useState,
 } from 'react'
@@ -39,13 +40,17 @@ import { TerminalPreferencesManager } from '@/utils/terminal-preferences'
 import VoiceInput from './VoiceInput'
 
 // ---------------------------------------------------------------------------
-// ghostty-web singleton — identical to vibetunnel's ensureGhostty()
+// Module-level singletons — created once, never re-created
 // ---------------------------------------------------------------------------
 let ghosttyPromise: Promise<Ghostty> | null = null
 function ensureGhostty(): Promise<Ghostty> {
   if (!ghosttyPromise) ghosttyPromise = Ghostty.load()
   return ghosttyPromise
 }
+
+// Cache the preferences singleton at module level — avoids getInstance() call
+// on every render and every fitTerminal() invocation.
+const prefs = TerminalPreferencesManager.getInstance()
 
 // ---------------------------------------------------------------------------
 // Public API exposed via ref
@@ -137,7 +142,6 @@ const TerminalRenderer = forwardRef<TerminalRendererHandle, TerminalRendererProp
       const proposed = fit.proposeDimensions()
       if (!proposed) return
 
-      const prefs   = TerminalPreferencesManager.getInstance()
       const maxCols = prefs.getMaxCols()
 
       let cols  = Math.max(20, Math.floor(proposed.cols))
@@ -175,8 +179,6 @@ const TerminalRenderer = forwardRef<TerminalRendererHandle, TerminalRendererProp
 
         // Guard: don't double-init if StrictMode already ran this
         if (termRef.current) return
-
-        const prefs = TerminalPreferencesManager.getInstance()
 
         // disableStdin: false — Terminal's built-in InputHandler captures keydown
         // and fires term.onData() with properly encoded VT sequences.
@@ -318,9 +320,13 @@ const TerminalRenderer = forwardRef<TerminalRendererHandle, TerminalRendererProp
       onDataRef.current(text)
     }
 
-    const bgColor = getThemeColors(
-      TerminalPreferencesManager.getInstance().getTheme()
-    ).background ?? '#282A36'
+    // useMemo — bgColor only changes when theme preference changes (rare).
+    // Avoids re-computing theme colors on every render (e.g. scroll button toggle).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    const bgColor = useMemo(
+      () => getThemeColors(prefs.getTheme()).background ?? '#282A36',
+      [] // prefs is a module-level singleton; theme changes are applied via term.options.theme
+    )
 
     // -----------------------------------------------------------------------
     // Render

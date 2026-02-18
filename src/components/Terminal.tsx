@@ -63,6 +63,10 @@ const sshEncoder  = new TextEncoder()  // for encoding keystrokes
 // Fix 7: Reconstruct VT100 escape sequences from a TerminalSnapshot
 // so Ghostty renders the exact terminal state (colors, cursor, TUI apps).
 // ---------------------------------------------------------------------------
+// Reusable SGR array — avoids allocating a new array for every terminal cell
+// during snapshot rendering (can be 11,000+ cells for a large terminal).
+const _sgr: number[] = []
+
 function snapshotToVT(snap: TerminalSnapshot): string {
   const parts: string[] = []
 
@@ -71,60 +75,53 @@ function snapshotToVT(snap: TerminalSnapshot): string {
 
   for (let r = 0; r < snap.lines.length; r++) {
     const cells = snap.lines[r]
-    let col = 0
 
     for (const cell of cells) {
       if (cell.w === 0) continue  // wide char continuation
 
-      // Build SGR (Select Graphic Rendition) sequence
-      const sgr: number[] = [0]  // always reset first
+      // Reuse _sgr array — reset length to 0, then push codes
+      _sgr.length = 0
+      _sgr.push(0)  // always reset first
 
       // Attributes
-      if (cell.at & ATTR_BOLD)          sgr.push(1)
-      if (cell.at & ATTR_DIM)           sgr.push(2)
-      if (cell.at & ATTR_ITALIC)        sgr.push(3)
-      if (cell.at & ATTR_UNDERLINE)     sgr.push(4)
-      if (cell.at & ATTR_BLINK)         sgr.push(5)
-      if (cell.at & ATTR_INVERSE)       sgr.push(7)
-      if (cell.at & ATTR_INVISIBLE)     sgr.push(8)
-      if (cell.at & ATTR_STRIKETHROUGH) sgr.push(9)
+      if (cell.at & ATTR_BOLD)          _sgr.push(1)
+      if (cell.at & ATTR_DIM)           _sgr.push(2)
+      if (cell.at & ATTR_ITALIC)        _sgr.push(3)
+      if (cell.at & ATTR_UNDERLINE)     _sgr.push(4)
+      if (cell.at & ATTR_BLINK)         _sgr.push(5)
+      if (cell.at & ATTR_INVERSE)       _sgr.push(7)
+      if (cell.at & ATTR_INVISIBLE)     _sgr.push(8)
+      if (cell.at & ATTR_STRIKETHROUGH) _sgr.push(9)
 
       // Foreground color
       if (cell.fg >= 0) {
         if (cell.fg < 8) {
-          sgr.push(30 + cell.fg)
+          _sgr.push(30 + cell.fg)
         } else if (cell.fg < 16) {
-          sgr.push(90 + (cell.fg - 8))
+          _sgr.push(90 + (cell.fg - 8))
         } else if (cell.fg < 256) {
-          sgr.push(38, 5, cell.fg)
+          _sgr.push(38, 5, cell.fg)
         } else {
           // 24-bit RGB encoded as (r<<16|g<<8|b)
-          const r = (cell.fg >> 16) & 0xff
-          const g = (cell.fg >> 8)  & 0xff
-          const b =  cell.fg        & 0xff
-          sgr.push(38, 2, r, g, b)
+          _sgr.push(38, 2, (cell.fg >> 16) & 0xff, (cell.fg >> 8) & 0xff, cell.fg & 0xff)
         }
       }
 
       // Background color
       if (cell.bg >= 0) {
         if (cell.bg < 8) {
-          sgr.push(40 + cell.bg)
+          _sgr.push(40 + cell.bg)
         } else if (cell.bg < 16) {
-          sgr.push(100 + (cell.bg - 8))
+          _sgr.push(100 + (cell.bg - 8))
         } else if (cell.bg < 256) {
-          sgr.push(48, 5, cell.bg)
+          _sgr.push(48, 5, cell.bg)
         } else {
-          const r = (cell.bg >> 16) & 0xff
-          const g = (cell.bg >> 8)  & 0xff
-          const b =  cell.bg        & 0xff
-          sgr.push(48, 2, r, g, b)
+          _sgr.push(48, 2, (cell.bg >> 16) & 0xff, (cell.bg >> 8) & 0xff, cell.bg & 0xff)
         }
       }
 
-      parts.push(`\x1b[${sgr.join(';')}m`)
+      parts.push(`\x1b[${_sgr.join(';')}m`)
       parts.push(cell.ch)
-      col += cell.w
     }
 
     // Reset at end of each line, move to next line
@@ -134,11 +131,8 @@ function snapshotToVT(snap: TerminalSnapshot): string {
     }
   }
 
-  // Reset all attributes
-  parts.push('\x1b[0m')
-
-  // Position cursor
-  parts.push(`\x1b[${snap.cursorY + 1};${snap.cursorX + 1}H`)
+  // Reset all attributes + position cursor
+  parts.push(`\x1b[0m\x1b[${snap.cursorY + 1};${snap.cursorX + 1}H`)
 
   return parts.join('')
 }

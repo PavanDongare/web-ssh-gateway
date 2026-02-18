@@ -84,14 +84,17 @@ export function decodeFrame(buffer: ArrayBuffer): DecodedFrame | null {
   return { type, payload }
 }
 
+// Singleton decoder — avoids allocating a new TextDecoder on every frame
+const _decoder = new TextDecoder()
+
 /** Decode a JSON payload from a frame */
 export function decodeJsonPayload<T>(payload: Uint8Array): T {
-  return JSON.parse(new TextDecoder().decode(payload)) as T
+  return JSON.parse(_decoder.decode(payload)) as T
 }
 
 /** Decode a text payload from a frame */
 export function decodeTextPayload(payload: Uint8Array): string {
-  return new TextDecoder().decode(payload)
+  return _decoder.decode(payload)
 }
 
 // ---------------------------------------------------------------------------

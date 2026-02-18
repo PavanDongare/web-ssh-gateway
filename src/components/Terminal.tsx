@@ -54,9 +54,10 @@ function backoffDelay(attempt: number): number {
 }
 
 // ---------------------------------------------------------------------------
-// Fix 6: TextDecoder singleton for binary SSH output
+// Fix 6: Singleton codec instances — avoid per-call allocation
 // ---------------------------------------------------------------------------
-const sshDecoder = new TextDecoder()
+const sshDecoder  = new TextDecoder()
+const sshEncoder  = new TextEncoder()  // for encoding keystrokes
 
 // ---------------------------------------------------------------------------
 // Fix 7: Reconstruct VT100 escape sequences from a TerminalSnapshot
@@ -409,9 +410,8 @@ export default function Terminal({
   // ---------------------------------------------------------------------------
   const handleData = (data: string) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
-      // Fix 6: encode keystrokes as raw binary DATA frame
-      const bytes = new TextEncoder().encode(data)
-      wsRef.current.send(encodeFrame(MsgType.DATA, bytes))
+      // Use singleton encoder — avoids allocating a new TextEncoder on every keypress
+      wsRef.current.send(encodeFrame(MsgType.DATA, sshEncoder.encode(data)))
     }
   }
 

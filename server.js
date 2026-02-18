@@ -432,56 +432,89 @@ function handleAuth(ws, msg, onReady) {
         // Fix 7: create a headless terminal to track exact visual state
         const headlessTerm = createHeadlessTerminal(80, 24)
 
+        // Pre-allocate a fixed-size ring buffer for output replay.
+        // Avoids Buffer.concat on every chunk — just track write offset.
+        const ringBuf    = Buffer.allocUnsafe(MAX_OUTPUT_BUFFER)
+        let   ringOffset = 0
+        let   ringFull   = false
+
         // Fix 6: outputBuffer is now a raw Buffer (binary-safe), not a string
         session = {
           conn,
           stream,
           ws,
           lastActivity: Date.now(),
-          outputBuffer: Buffer.alloc(0),
+          // Expose a getter so attachToSession can read the ring buffer
+          get outputBuffer() {
+            if (!ringFull && ringOffset === 0) return Buffer.alloc(0)
+            if (!ringFull) return ringBuf.slice(0, ringOffset)
+            // Ring wrapped: return [ringOffset..end] + [0..ringOffset]
+            return Buffer.concat([ringBuf.slice(ringOffset), ringBuf.slice(0, ringOffset)])
+          },
           headlessTerm,  // Fix 7: headless terminal for snapshot
         }
 
         const appendToBuffer = (chunk) => {
-          // chunk is a Buffer from ssh2 — keep it binary
-          const combined = Buffer.concat([session.outputBuffer, chunk])
-          if (combined.length > MAX_OUTPUT_BUFFER) {
-            session.outputBuffer = combined.slice(combined.length - MAX_OUTPUT_BUFFER)
-          } else {
-            session.outputBuffer = combined
+          // Write chunk into ring buffer — O(n) copy, no allocation
+          let src = 0
+          while (src < chunk.length) {
+            const space = MAX_OUTPUT_BUFFER - ringOffset
+            const toCopy = Math.min(space, chunk.length - src)
+            chunk.copy(ringBuf, ringOffset, src, src + toCopy)
+            src += toCopy
+            ringOffset = (ringOffset + toCopy) % MAX_OUTPUT_BUFFER
+            if (ringOffset === 0) ringFull = true
           }
 
           // Fix 7: feed raw bytes into the headless terminal so it tracks state
-          // xterm.write() accepts Buffer/Uint8Array directly
           if (session.headlessTerm) {
             session.headlessTerm.write(chunk)
           }
         }
 
-        // Server-side output batching — accumulate SSH chunks for up to 10ms
-        let batchChunks = []
-        let batchTimer = null
+        // Server-side output batching — leading-edge: send immediately on first
+        // chunk (zero latency for echo), then coalesce subsequent chunks that
+        // arrive in the same I/O tick via setImmediate (no timer overhead).
+        let batchChunks  = []
+        let batchPending = false
+
         const flushBatch = () => {
-          batchTimer = null
+          batchPending = false
           if (batchChunks.length === 0) return
-          const combined = Buffer.concat(batchChunks)
+          const combined = batchChunks.length === 1 ? batchChunks[0] : Buffer.concat(batchChunks)
           batchChunks = []
           if (session.ws?.readyState === WebSocket.OPEN) {
-            // Fix 6: send raw binary SSH_DATA frame
             session.ws.send(encodeFrame(MsgType.SSH_DATA, combined))
+          }
+        }
+
+        const enqueueChunk = (data) => {
+          appendToBuffer(data)
+          const isFirst = batchChunks.length === 0
+          batchChunks.push(data)
+          if (isFirst) {
+            // Send immediately — zero latency for the first chunk (echo)
+            flushBatch()
+            // Schedule a setImmediate to catch any chunks arriving in the same tick
+            if (!batchPending) {
+              batchPending = true
+              setImmediate(flushBatch)
+            }
+          } else if (!batchPending) {
+            batchPending = true
+            setImmediate(flushBatch)
           }
         }
 
         // Pipe SSH stdout → WebSocket (binary-safe) + headless terminal
         stream.on('data', (data) => {
-          appendToBuffer(data)
-          batchChunks.push(data)
-          if (!batchTimer) batchTimer = setTimeout(flushBatch, 10)
+          enqueueChunk(data)
         })
 
         stream.on('close', () => {
           console.log('Stream closed')
-          if (batchTimer) { clearTimeout(batchTimer); batchTimer = null }
+          batchPending = false
+          batchChunks  = []
           if (session.headlessTerm) { session.headlessTerm.dispose(); session.headlessTerm = null }
           if (session.ws?.readyState === WebSocket.OPEN) {
             session.ws.send(encodeFrame(MsgType.DISCONNECTED))
@@ -491,9 +524,7 @@ function handleAuth(ws, msg, onReady) {
         })
 
         stream.stderr.on('data', (data) => {
-          appendToBuffer(data)
-          batchChunks.push(data)
-          if (!batchTimer) batchTimer = setTimeout(flushBatch, 10)
+          enqueueChunk(data)
         })
 
         ws.send(encodeFrame(MsgType.CONNECTED))

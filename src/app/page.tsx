@@ -1,6 +1,7 @@
 'use client'
 
 import { useState, useCallback, useEffect } from 'react'
+import Link from 'next/link'
 import Terminal from '@/components/Terminal'
 import ConnectionModal, { ConnectionConfig, type ConnectionMode } from '@/components/ConnectionModal'
 
@@ -175,25 +176,33 @@ export default function Home() {
             <span className="text-sm font-semibold text-[#09090b] tracking-tight">WebSSH Gateway</span>
           </div>
 
-          <button
-            onClick={() => setIsModalOpen(true)}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#09090b] text-white text-xs font-medium rounded-md hover:bg-[#27272a] transition-colors duration-150"
-          >
-            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M12 4v16m8-8H4" />
-            </svg>
-            <span className="hidden sm:inline">New Connection</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => setIsSavedPanelOpen(true)}
-            className="md:hidden ml-2 inline-flex items-center justify-center w-8 h-8 border border-[#e4e4e7] rounded-md text-[#3f3f46] hover:text-[#09090b] hover:bg-[#f4f4f5] transition-colors"
-            title="Saved Connections"
-          >
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
-            </svg>
-          </button>
+          <div className="flex items-center gap-2">
+            <Link
+              href="/help"
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white border border-[#e4e4e7] text-[#3f3f46] text-xs font-medium rounded-md hover:bg-[#f4f4f5] hover:text-[#09090b] transition-colors duration-150"
+            >
+              Help
+            </Link>
+            <button
+              onClick={() => setIsModalOpen(true)}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#09090b] text-white text-xs font-medium rounded-md hover:bg-[#27272a] transition-colors duration-150"
+            >
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M12 4v16m8-8H4" />
+              </svg>
+              <span className="hidden sm:inline">New Connection</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setIsSavedPanelOpen(true)}
+              className="md:hidden inline-flex items-center justify-center w-8 h-8 border border-[#e4e4e7] rounded-md text-[#3f3f46] hover:text-[#09090b] hover:bg-[#f4f4f5] transition-colors"
+              title="Saved Connections"
+            >
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
+              </svg>
+            </button>
+          </div>
         </div>
       </header>
 

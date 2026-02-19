@@ -43,6 +43,7 @@ const port     = 3000
 
 const SESSION_TIMEOUT_MS = 300_000   // 5 minutes to reconnect
 const MAX_OUTPUT_BUFFER  = 200 * 1024 // 200 KB ring buffer per session
+const ENABLE_HEADLESS_SNAPSHOT = false // tmux handles session continuity
 
 // ---------------------------------------------------------------------------
 // Types
@@ -65,6 +66,12 @@ interface ReconnectMessage {
 interface ResizeMessage {
   cols: number
   rows: number
+}
+
+function tmuxSessionNameFromTabId(tabId: string): string {
+  // tmux session names are safest with a restricted charset.
+  const safe = tabId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 48)
+  return `webssh_${safe || 'session'}`
 }
 
 interface Session {
@@ -293,8 +300,13 @@ function handleAuth(
       }
 
       console.log('Shell opened')
+      const tmuxSession = tmuxSessionNameFromTabId(tabId)
+      // Open/attach deterministic tmux session per browser tab id.
+      // -A: attach if exists, otherwise create
+      // -s: session name
+      stream.write(`tmux new-session -A -s ${tmuxSession}\n`)
 
-      const headlessTerm = createHeadlessTerminal(80, 24)
+      const headlessTerm = ENABLE_HEADLESS_SNAPSHOT ? createHeadlessTerminal(80, 24) : null
 
       // Ring buffer — avoids Buffer.concat on every chunk
       const ringBuf    = Buffer.allocUnsafe(MAX_OUTPUT_BUFFER)
@@ -327,7 +339,9 @@ function handleAuth(
           ringOffset = (ringOffset + toCopy) % MAX_OUTPUT_BUFFER
           if (ringOffset === 0) ringFull = true
         }
-        if (session?.headlessTerm) session.headlessTerm.write(chunk)
+        if (ENABLE_HEADLESS_SNAPSHOT && session?.headlessTerm) {
+          session.headlessTerm.write(chunk)
+        }
       }
 
       // Output batching — leading-edge flush (zero latency for echo),

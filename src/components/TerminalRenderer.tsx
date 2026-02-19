@@ -190,7 +190,7 @@ const TerminalRenderer = forwardRef<TerminalRendererHandle, TerminalRendererProp
           fontFamily:           TERMINAL_FONT_FAMILY,
           theme:                getThemeColors(prefs.getTheme()),
           cursorBlink:          true,
-          smoothScrollDuration: 120,
+          smoothScrollDuration: 0,
           disableStdin:         false,
           ghostty,
         })

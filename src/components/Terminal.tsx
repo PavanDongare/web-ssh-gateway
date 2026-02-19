@@ -190,7 +190,7 @@ export default function Terminal({
     let offset = 0
     for (const c of chunks) { combined.set(c, offset); offset += c.length }
     const text = sshDecoder.decode(combined, { stream: true })
-    rendererRef.current?.write(text, true)
+    rendererRef.current?.write(text, false)
   }
 
   const enqueueOutput = (chunk: Uint8Array) => {

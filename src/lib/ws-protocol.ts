@@ -20,7 +20,7 @@
 // across module boundaries with Next.js (isolatedModules: true).
 export const MsgType = {
   // Client → Server
-  AUTH:      0x01,  // JSON payload: { tabId, host, port, username, password?, privateKey?, passphrase? }
+  AUTH:      0x01,  // JSON payload: { tabId, mode?: 'ssh'|'local', host?, port?, username?, password?, privateKey?, passphrase? }
   RECONNECT: 0x02,  // JSON payload: { tabId }
   DATA:      0x03,  // Raw binary payload: keystrokes / paste data
   RESIZE:    0x04,  // JSON payload: { cols, rows }

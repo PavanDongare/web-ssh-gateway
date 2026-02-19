@@ -8,17 +8,27 @@ interface ConnectionModalProps {
   onConnect: (config: ConnectionConfig) => void
 }
 
+export type ConnectionMode = 'ssh' | 'local'
+
 export interface ConnectionConfig {
-  host: string
-  port: number
-  username: string
+  mode: ConnectionMode
+  name?: string
+  host?: string
+  port?: number
+  username?: string
   password?: string
   privateKey?: string
   passphrase?: string
   authMethod: 'password' | 'key'
 }
 
-export default function ConnectionModal({ isOpen, onClose, onConnect }: ConnectionModalProps) {
+export default function ConnectionModal({
+  isOpen,
+  onClose,
+  onConnect,
+}: ConnectionModalProps) {
+  const [mode, setMode] = useState<ConnectionMode>('ssh')
+  const [name, setName] = useState('')
   const [host, setHost] = useState('')
   const [port, setPort] = useState('22')
   const [username, setUsername] = useState('')
@@ -28,20 +38,26 @@ export default function ConnectionModal({ isOpen, onClose, onConnect }: Connecti
   const [passphrase, setPassphrase] = useState('')
 
   const handleConnect = () => {
-    if (!host || !username) { alert('Host and username are required'); return }
-    if (authMethod === 'password' && !password) { alert('Password is required'); return }
-    if (authMethod === 'key' && !privateKey) { alert('Private key is required'); return }
+    if (mode === 'ssh') {
+      if (!host || !username) { alert('Host and username are required'); return }
+      if (authMethod === 'password' && !password) { alert('Password is required'); return }
+      if (authMethod === 'key' && !privateKey) { alert('Private key is required'); return }
+    }
 
     onConnect({
-      host,
-      port: parseInt(port) || 22,
-      username,
+      mode,
+      name: name.trim() || undefined,
+      host: mode === 'ssh' ? host : undefined,
+      port: mode === 'ssh' ? (parseInt(port) || 22) : undefined,
+      username: mode === 'ssh' ? username : undefined,
       password: authMethod === 'password' ? password : undefined,
       privateKey: authMethod === 'key' ? privateKey : undefined,
       passphrase: authMethod === 'key' ? passphrase : undefined,
       authMethod,
     })
 
+    setMode('ssh')
+    setName('')
     setHost(''); setPort('22'); setUsername('')
     setPassword(''); setPrivateKey(''); setPassphrase('')
     onClose()
@@ -60,7 +76,9 @@ export default function ConnectionModal({ isOpen, onClose, onConnect }: Connecti
         <div className="flex items-center justify-between px-5 py-4 border-b border-[#e4e4e7]">
           <div>
             <h2 className="text-sm font-semibold text-[#09090b]">New Connection</h2>
-            <p className="text-xs text-[#71717a] mt-0.5">Connect to an SSH server</p>
+            <p className="text-xs text-[#71717a] mt-0.5">
+              {mode === 'ssh' ? 'Connect to an SSH server' : 'Open a local shell on this host'}
+            </p>
           </div>
           <button
             onClick={onClose}
@@ -74,109 +92,156 @@ export default function ConnectionModal({ isOpen, onClose, onConnect }: Connecti
 
         {/* Body */}
         <div className="px-5 py-4 space-y-4">
-
-          {/* Host & Port */}
-          <div className="flex gap-3">
-            <div className="flex-1 space-y-1.5">
-              <label className="block text-xs font-medium text-[#3f3f46]">Host</label>
-              <input
-                type="text"
-                value={host}
-                onChange={(e) => setHost(e.target.value)}
-                placeholder="192.168.1.100"
-                className="w-full px-3 py-2 bg-white border border-[#e4e4e7] rounded-md text-sm text-[#09090b] placeholder-[#a1a1aa] focus:outline-none focus:ring-1 focus:ring-[#09090b] focus:border-[#09090b] transition-colors font-mono"
-              />
-            </div>
-            <div className="w-20 space-y-1.5">
-              <label className="block text-xs font-medium text-[#3f3f46]">Port</label>
-              <input
-                type="text"
-                value={port}
-                onChange={(e) => setPort(e.target.value)}
-                placeholder="22"
-                className="w-full px-3 py-2 bg-white border border-[#e4e4e7] rounded-md text-sm text-[#09090b] placeholder-[#a1a1aa] focus:outline-none focus:ring-1 focus:ring-[#09090b] focus:border-[#09090b] transition-colors font-mono"
-              />
-            </div>
-          </div>
-
-          {/* Username */}
           <div className="space-y-1.5">
-            <label className="block text-xs font-medium text-[#3f3f46]">Username</label>
-            <input
-              type="text"
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              placeholder="root"
-              className="w-full px-3 py-2 bg-white border border-[#e4e4e7] rounded-md text-sm text-[#09090b] placeholder-[#a1a1aa] focus:outline-none focus:ring-1 focus:ring-[#09090b] focus:border-[#09090b] transition-colors font-mono"
-            />
-          </div>
-
-          {/* Auth Method — segmented control */}
-          <div className="space-y-1.5">
-            <label className="block text-xs font-medium text-[#3f3f46]">Authentication</label>
+            <label className="block text-xs font-medium text-[#3f3f46]">Mode</label>
             <div className="flex bg-[#f4f4f5] border border-[#e4e4e7] rounded-md p-0.5">
               <button
                 type="button"
-                onClick={() => setAuthMethod('password')}
+                onClick={() => setMode('ssh')}
                 className={`flex-1 py-1.5 text-xs font-medium rounded transition-colors duration-150 ${
-                  authMethod === 'password'
+                  mode === 'ssh'
                     ? 'bg-white text-[#09090b] shadow-sm border border-[#e4e4e7]'
                     : 'text-[#71717a] hover:text-[#3f3f46]'
                 }`}
               >
-                Password
+                SSH
               </button>
               <button
                 type="button"
-                onClick={() => setAuthMethod('key')}
+                onClick={() => setMode('local')}
                 className={`flex-1 py-1.5 text-xs font-medium rounded transition-colors duration-150 ${
-                  authMethod === 'key'
+                  mode === 'local'
                     ? 'bg-white text-[#09090b] shadow-sm border border-[#e4e4e7]'
                     : 'text-[#71717a] hover:text-[#3f3f46]'
                 }`}
               >
-                SSH Key
+                Local Terminal
               </button>
             </div>
           </div>
 
-          {/* Password field */}
-          {authMethod === 'password' ? (
+          {mode === 'local' && (
             <div className="space-y-1.5">
-              <label className="block text-xs font-medium text-[#3f3f46]">Password</label>
+              <label className="block text-xs font-medium text-[#3f3f46]">
+                Session Name
+                <span className="ml-1 text-[#a1a1aa] font-normal">(optional)</span>
+              </label>
               <input
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="••••••••"
+                type="text"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="My Local Shell"
                 className="w-full px-3 py-2 bg-white border border-[#e4e4e7] rounded-md text-sm text-[#09090b] placeholder-[#a1a1aa] focus:outline-none focus:ring-1 focus:ring-[#09090b] focus:border-[#09090b] transition-colors"
               />
             </div>
-          ) : (
+          )}
+
+          {mode === 'ssh' && (
             <>
-              <div className="space-y-1.5">
-                <label className="block text-xs font-medium text-[#3f3f46]">Private Key</label>
-                <textarea
-                  value={privateKey}
-                  onChange={(e) => setPrivateKey(e.target.value)}
-                  placeholder={`-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----`}
-                  rows={4}
-                  className="w-full px-3 py-2 bg-white border border-[#e4e4e7] rounded-md text-xs text-[#09090b] placeholder-[#a1a1aa] focus:outline-none focus:ring-1 focus:ring-[#09090b] focus:border-[#09090b] transition-colors font-mono resize-none"
-                />
+              {/* Host & Port */}
+              <div className="flex gap-3">
+                <div className="flex-1 space-y-1.5">
+                  <label className="block text-xs font-medium text-[#3f3f46]">Host</label>
+                  <input
+                    type="text"
+                    value={host}
+                    onChange={(e) => setHost(e.target.value)}
+                    placeholder="192.168.1.100"
+                    className="w-full px-3 py-2 bg-white border border-[#e4e4e7] rounded-md text-sm text-[#09090b] placeholder-[#a1a1aa] focus:outline-none focus:ring-1 focus:ring-[#09090b] focus:border-[#09090b] transition-colors font-mono"
+                  />
+                </div>
+                <div className="w-20 space-y-1.5">
+                  <label className="block text-xs font-medium text-[#3f3f46]">Port</label>
+                  <input
+                    type="text"
+                    value={port}
+                    onChange={(e) => setPort(e.target.value)}
+                    placeholder="22"
+                    className="w-full px-3 py-2 bg-white border border-[#e4e4e7] rounded-md text-sm text-[#09090b] placeholder-[#a1a1aa] focus:outline-none focus:ring-1 focus:ring-[#09090b] focus:border-[#09090b] transition-colors font-mono"
+                  />
+                </div>
               </div>
+
+              {/* Username */}
               <div className="space-y-1.5">
-                <label className="block text-xs font-medium text-[#3f3f46]">
-                  Passphrase
-                  <span className="ml-1 text-[#a1a1aa] font-normal">(optional)</span>
-                </label>
+                <label className="block text-xs font-medium text-[#3f3f46]">Username</label>
                 <input
-                  type="password"
-                  value={passphrase}
-                  onChange={(e) => setPassphrase(e.target.value)}
-                  placeholder="Key passphrase"
-                  className="w-full px-3 py-2 bg-white border border-[#e4e4e7] rounded-md text-sm text-[#09090b] placeholder-[#a1a1aa] focus:outline-none focus:ring-1 focus:ring-[#09090b] focus:border-[#09090b] transition-colors"
+                  type="text"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  placeholder="root"
+                  className="w-full px-3 py-2 bg-white border border-[#e4e4e7] rounded-md text-sm text-[#09090b] placeholder-[#a1a1aa] focus:outline-none focus:ring-1 focus:ring-[#09090b] focus:border-[#09090b] transition-colors font-mono"
                 />
               </div>
+
+              {/* Auth Method — segmented control */}
+              <div className="space-y-1.5">
+                <label className="block text-xs font-medium text-[#3f3f46]">Authentication</label>
+                <div className="flex bg-[#f4f4f5] border border-[#e4e4e7] rounded-md p-0.5">
+                  <button
+                    type="button"
+                    onClick={() => setAuthMethod('password')}
+                    className={`flex-1 py-1.5 text-xs font-medium rounded transition-colors duration-150 ${
+                      authMethod === 'password'
+                        ? 'bg-white text-[#09090b] shadow-sm border border-[#e4e4e7]'
+                        : 'text-[#71717a] hover:text-[#3f3f46]'
+                    }`}
+                  >
+                    Password
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setAuthMethod('key')}
+                    className={`flex-1 py-1.5 text-xs font-medium rounded transition-colors duration-150 ${
+                      authMethod === 'key'
+                        ? 'bg-white text-[#09090b] shadow-sm border border-[#e4e4e7]'
+                        : 'text-[#71717a] hover:text-[#3f3f46]'
+                    }`}
+                  >
+                    SSH Key
+                  </button>
+                </div>
+              </div>
+
+              {/* Password field */}
+              {authMethod === 'password' ? (
+                <div className="space-y-1.5">
+                  <label className="block text-xs font-medium text-[#3f3f46]">Password</label>
+                  <input
+                    type="password"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder="••••••••"
+                    className="w-full px-3 py-2 bg-white border border-[#e4e4e7] rounded-md text-sm text-[#09090b] placeholder-[#a1a1aa] focus:outline-none focus:ring-1 focus:ring-[#09090b] focus:border-[#09090b] transition-colors"
+                  />
+                </div>
+              ) : (
+                <>
+                  <div className="space-y-1.5">
+                    <label className="block text-xs font-medium text-[#3f3f46]">Private Key</label>
+                    <textarea
+                      value={privateKey}
+                      onChange={(e) => setPrivateKey(e.target.value)}
+                      placeholder={`-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----`}
+                      rows={4}
+                      className="w-full px-3 py-2 bg-white border border-[#e4e4e7] rounded-md text-xs text-[#09090b] placeholder-[#a1a1aa] focus:outline-none focus:ring-1 focus:ring-[#09090b] focus:border-[#09090b] transition-colors font-mono resize-none"
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <label className="block text-xs font-medium text-[#3f3f46]">
+                      Passphrase
+                      <span className="ml-1 text-[#a1a1aa] font-normal">(optional)</span>
+                    </label>
+                    <input
+                      type="password"
+                      value={passphrase}
+                      onChange={(e) => setPassphrase(e.target.value)}
+                      placeholder="Key passphrase"
+                      className="w-full px-3 py-2 bg-white border border-[#e4e4e7] rounded-md text-sm text-[#09090b] placeholder-[#a1a1aa] focus:outline-none focus:ring-1 focus:ring-[#09090b] focus:border-[#09090b] transition-colors"
+                    />
+                  </div>
+                </>
+              )}
             </>
           )}
         </div>

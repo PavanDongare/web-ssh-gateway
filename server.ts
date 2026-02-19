@@ -13,6 +13,8 @@ import { parse } from 'url'
 import next from 'next'
 import WebSocket, { WebSocketServer } from 'ws'
 import { Client as SshClient, ClientChannel, ConnectConfig } from 'ssh2'
+import type { IPty } from 'node-pty'
+import * as nodePty from 'node-pty'
 import { Terminal as XTerminal } from '@xterm/xterm'
 
 // Shared protocol — single source of truth (no more "keep in sync" comments)
@@ -44,6 +46,7 @@ const port     = 3000
 const SESSION_TIMEOUT_MS = 300_000   // 5 minutes to reconnect
 const MAX_OUTPUT_BUFFER  = 200 * 1024 // 200 KB ring buffer per session
 const ENABLE_HEADLESS_SNAPSHOT = false // tmux handles session continuity
+const LOCAL_SHARED_TAB_ID = 'local-machine-terminal'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -51,9 +54,10 @@ const ENABLE_HEADLESS_SNAPSHOT = false // tmux handles session continuity
 
 interface AuthMessage {
   tabId:       string
-  host:        string
+  mode?:       'ssh' | 'local'
+  host?:       string
   port?:       number | string
-  username:    string
+  username?:   string
   password?:   string
   privateKey?: string
   passphrase?: string
@@ -75,8 +79,10 @@ function tmuxSessionNameFromTabId(tabId: string): string {
 }
 
 interface Session {
-  conn:         SshClient
-  stream:       ClientChannel
+  backend:      'ssh' | 'local'
+  conn?:        SshClient
+  stream?:      ClientChannel
+  pty?:         IPty
   ws:           WebSocket | null
   lastActivity: number
   outputBuffer: Buffer          // getter — reads from ring buffer
@@ -90,6 +96,7 @@ interface SessionInternal extends Omit<Session, 'outputBuffer'> {
   _ringFull:   boolean
   outputBuffer: Buffer
 }
+const payloadDecoder = new TextDecoder()
 
 // ---------------------------------------------------------------------------
 // Session store
@@ -208,6 +215,82 @@ function serializeSnapshot(term: XTerminal): TerminalSnapshot {
   }
 }
 
+function createSessionState(
+  backend: 'ssh' | 'local',
+  ws: WebSocket,
+  extras: { conn?: SshClient; stream?: ClientChannel; pty?: IPty },
+): SessionInternal {
+  const ringBuf = Buffer.allocUnsafe(MAX_OUTPUT_BUFFER)
+  const ringOffset = 0
+  const ringFull = false
+
+  return {
+    backend,
+    ...extras,
+    ws,
+    lastActivity: Date.now(),
+    headlessTerm: ENABLE_HEADLESS_SNAPSHOT ? createHeadlessTerminal(80, 24) : null,
+    _ringBuf: ringBuf,
+    _ringOffset: ringOffset,
+    _ringFull: ringFull,
+    get outputBuffer(): Buffer {
+      if (!ringFull && ringOffset === 0) return Buffer.alloc(0)
+      if (!ringFull) return ringBuf.slice(0, ringOffset)
+      return Buffer.concat([ringBuf.slice(ringOffset), ringBuf.slice(0, ringOffset)])
+    },
+  }
+}
+
+function appendOutput(session: SessionInternal, chunk: Buffer): void {
+  let src = 0
+  while (src < chunk.length) {
+    const space = MAX_OUTPUT_BUFFER - session._ringOffset
+    const toCopy = Math.min(space, chunk.length - src)
+    chunk.copy(session._ringBuf, session._ringOffset, src, src + toCopy)
+    src += toCopy
+    session._ringOffset = (session._ringOffset + toCopy) % MAX_OUTPUT_BUFFER
+    if (session._ringOffset === 0) session._ringFull = true
+  }
+  if (ENABLE_HEADLESS_SNAPSHOT && session.headlessTerm) {
+    session.headlessTerm.write(chunk)
+  }
+}
+
+function closeSession(tabId: string, session: SessionInternal): void {
+  if (!sessions.has(tabId)) return
+  if (session.headlessTerm) {
+    session.headlessTerm.dispose()
+    session.headlessTerm = null
+  }
+  if (session.backend === 'ssh') {
+    session.stream?.close()
+    session.conn?.end()
+  } else {
+    session.pty?.kill()
+  }
+  sessions.delete(tabId)
+}
+
+function writeToSession(session: SessionInternal, payload: Buffer): void {
+  if (session.backend === 'ssh' && session.stream?.writable) {
+    session.stream.write(payload)
+    return
+  }
+  if (session.backend === 'local' && session.pty) {
+    session.pty.write(payloadDecoder.decode(payload))
+  }
+}
+
+function resizeSession(session: SessionInternal, cols: number, rows: number): void {
+  if (session.backend === 'ssh' && session.stream) {
+    session.stream.setWindow(rows, cols, 0, 0)
+  }
+  if (session.backend === 'local' && session.pty) {
+    session.pty.resize(cols, rows)
+  }
+  session.headlessTerm?.resize(cols, rows)
+}
+
 // ---------------------------------------------------------------------------
 // Session cleanup — every 30 s
 // ---------------------------------------------------------------------------
@@ -216,11 +299,8 @@ setInterval(() => {
   const now = Date.now()
   for (const [tabId, session] of sessions) {
     if (now - session.lastActivity > SESSION_TIMEOUT_MS) {
-      console.log(`Session ${tabId} expired, closing SSH`)
-      if (session.headlessTerm) { session.headlessTerm.dispose(); session.headlessTerm = null }
-      if (session.stream) session.stream.close()
-      if (session.conn)   session.conn.end()
-      sessions.delete(tabId)
+      console.log(`Session ${tabId} expired, closing ${session.backend} backend`)
+      closeSession(tabId, session)
     }
   }
 }, 30_000)
@@ -253,12 +333,12 @@ function attachToSession(ws: WebSocket, tabId: string, session: SessionInternal)
 }
 
 // ---------------------------------------------------------------------------
-// SSH auth + shell
+// Auth/session bootstrap
 // ---------------------------------------------------------------------------
 
-function handleAuth(
-  ws:      WebSocket,
-  msg:     AuthMessage,
+function handleSshAuth(
+  ws: WebSocket,
+  msg: AuthMessage,
   onReady: (session: SessionInternal) => void,
 ): void {
   const { host, port: sshPort = 22, username, password, privateKey, passphrase, tabId } = msg
@@ -301,66 +381,32 @@ function handleAuth(
 
       console.log('Shell opened')
       const tmuxSession = tmuxSessionNameFromTabId(tabId)
-      // Open/attach deterministic tmux session per browser tab id.
-      // -A: attach if exists, otherwise create
-      // -s: session name
-      stream.write(`tmux new-session -A -s ${tmuxSession}\n`)
+      // Keep tmux for session persistence but hide its bottom status line
+      // so the terminal viewport is not reduced by one row.
+      stream.write(
+        `tmux new-session -Ad -s ${tmuxSession}\n` +
+        `tmux set-option -t ${tmuxSession} status off\n` +
+        `tmux attach-session -t ${tmuxSession}\n`
+      )
 
-      const headlessTerm = ENABLE_HEADLESS_SNAPSHOT ? createHeadlessTerminal(80, 24) : null
+      session = createSessionState('ssh', ws, { conn, stream })
 
-      // Ring buffer — avoids Buffer.concat on every chunk
-      const ringBuf    = Buffer.allocUnsafe(MAX_OUTPUT_BUFFER)
-      let   ringOffset = 0
-      let   ringFull   = false
-
-      session = {
-        conn,
-        stream,
-        ws,
-        lastActivity: Date.now(),
-        headlessTerm,
-        _ringBuf:    ringBuf,
-        _ringOffset: ringOffset,
-        _ringFull:   ringFull,
-        get outputBuffer(): Buffer {
-          if (!ringFull && ringOffset === 0) return Buffer.alloc(0)
-          if (!ringFull) return ringBuf.slice(0, ringOffset)
-          return Buffer.concat([ringBuf.slice(ringOffset), ringBuf.slice(0, ringOffset)])
-        },
-      }
-
-      const appendToBuffer = (chunk: Buffer): void => {
-        let src = 0
-        while (src < chunk.length) {
-          const space   = MAX_OUTPUT_BUFFER - ringOffset
-          const toCopy  = Math.min(space, chunk.length - src)
-          chunk.copy(ringBuf, ringOffset, src, src + toCopy)
-          src       += toCopy
-          ringOffset = (ringOffset + toCopy) % MAX_OUTPUT_BUFFER
-          if (ringOffset === 0) ringFull = true
-        }
-        if (ENABLE_HEADLESS_SNAPSHOT && session?.headlessTerm) {
-          session.headlessTerm.write(chunk)
-        }
-      }
-
-      // Output batching — leading-edge flush (zero latency for echo),
-      // then coalesce subsequent chunks in the same I/O tick via setImmediate.
-      let batchChunks:  Buffer[] = []
-      let batchPending           = false
+      let batchChunks: Buffer[] = []
+      let batchPending = false
 
       const flushBatch = (): void => {
         batchPending = false
-        if (batchChunks.length === 0) return
+        if (batchChunks.length === 0 || !session) return
         const combined = batchChunks.length === 1 ? batchChunks[0] : Buffer.concat(batchChunks)
         batchChunks = []
-        if (session?.ws?.readyState === WebSocket.OPEN) {
+        if (session.ws?.readyState === WebSocket.OPEN) {
           session.ws.send(encodeFrame(MsgType.SSH_DATA, combined))
         }
       }
 
       const enqueueChunk = (data: Buffer): void => {
-        appendToBuffer(data)
+        if (!session) return
+        appendOutput(session, data)
         const isFirst = batchChunks.length === 0
         batchChunks.push(data)
         if (isFirst) {
@@ -373,19 +419,16 @@ function handleAuth(
       }
 
       stream.on('data', (data: Buffer) => enqueueChunk(data))
-
       stream.stderr.on('data', (data: Buffer) => enqueueChunk(data))
 
       stream.on('close', () => {
-        console.log('Stream closed')
+        console.log('SSH stream closed')
         batchPending = false
         batchChunks  = []
-        if (session?.headlessTerm) { session.headlessTerm.dispose(); session.headlessTerm = null }
         if (session?.ws?.readyState === WebSocket.OPEN) {
           session.ws.send(encodeFrame(MsgType.DISCONNECTED))
         }
-        sessions.delete(tabId)
-        conn.end()
+        if (session) closeSession(tabId, session)
       })
 
       ws.send(encodeFrame(MsgType.CONNECTED))
@@ -399,12 +442,10 @@ function handleAuth(
   })
 
   conn.on('close', () => {
-    console.log('SSH connection closed')
-    if (session?.headlessTerm) { session.headlessTerm.dispose(); session.headlessTerm = null }
     if (session?.ws?.readyState === WebSocket.OPEN) {
       session.ws.send(encodeFrame(MsgType.DISCONNECTED))
     }
-    sessions.delete(tabId)
+    if (session) closeSession(tabId, session)
   })
 
   try {
@@ -412,6 +453,90 @@ function handleAuth(
   } catch (err) {
     ws.send(encodeJsonFrame(MsgType.ERROR, { message: `Connection failed: ${(err as Error).message}` }))
   }
+}
+
+function handleLocalAuth(
+  ws: WebSocket,
+  msg: AuthMessage,
+  onReady: (session: SessionInternal) => void,
+): void {
+  const shell = process.env.SHELL || '/bin/zsh'
+  const localEnv: Record<string, string> = {}
+  for (const [key, value] of Object.entries(process.env)) {
+    if (typeof value === 'string') localEnv[key] = value
+  }
+  delete localEnv.npm_config_prefix
+
+  try {
+    const pty = nodePty.spawn(shell, ['-i', '-l'], {
+      name: 'xterm-256color',
+      cols: 80,
+      rows: 24,
+      cwd: process.env.HOME || process.cwd(),
+      env: localEnv,
+    })
+
+    const session = createSessionState('local', ws, { pty })
+    onReady(session)
+    ws.send(encodeFrame(MsgType.CONNECTED))
+
+    let batchChunks: Buffer[] = []
+    let batchPending = false
+
+    const flushBatch = (): void => {
+      batchPending = false
+      if (batchChunks.length === 0) return
+      const combined = batchChunks.length === 1 ? batchChunks[0] : Buffer.concat(batchChunks)
+      batchChunks = []
+      if (session.ws?.readyState === WebSocket.OPEN) {
+        session.ws.send(encodeFrame(MsgType.SSH_DATA, combined))
+      }
+    }
+
+    pty.onData((text: string) => {
+      const data = Buffer.from(text, 'utf8')
+      appendOutput(session, data)
+      const isFirst = batchChunks.length === 0
+      batchChunks.push(data)
+      if (isFirst) {
+        flushBatch()
+        if (!batchPending) { batchPending = true; setImmediate(flushBatch) }
+      } else if (!batchPending) {
+        batchPending = true
+        setImmediate(flushBatch)
+      }
+    })
+
+    pty.onExit(() => {
+      batchPending = false
+      batchChunks  = []
+      if (session.ws?.readyState === WebSocket.OPEN) {
+        session.ws.send(encodeFrame(MsgType.DISCONNECTED))
+      }
+      closeSession(msg.tabId, session)
+    })
+  } catch (err) {
+    ws.send(encodeJsonFrame(MsgType.ERROR, { message: `Local terminal failed: ${(err as Error).message}` }))
+  }
+}
+
+function handleAuth(
+  ws: WebSocket,
+  msg: AuthMessage,
+  onReady: (session: SessionInternal) => void,
+): void {
+  const mode = msg.mode ?? 'ssh'
+  if (mode === 'local') {
+    const localMsg: AuthMessage = { ...msg, tabId: LOCAL_SHARED_TAB_ID, mode: 'local' }
+    const existing = sessions.get(LOCAL_SHARED_TAB_ID)
+    if (existing) {
+      attachToSession(ws, LOCAL_SHARED_TAB_ID, existing)
+      return
+    }
+    handleLocalAuth(ws, localMsg, onReady)
+    return
+  }
+  handleSshAuth(ws, msg, onReady)
 }
 
 // ---------------------------------------------------------------------------
@@ -478,9 +603,13 @@ app.prepare().then(async () => {
 
         switch (frame.type) {
           case MsgType.AUTH: {
-            const msg = JSON.parse(frame.payload.toString('utf8')) as AuthMessage
+            const rawMsg = JSON.parse(frame.payload.toString('utf8')) as AuthMessage
+            const msg: AuthMessage =
+              (rawMsg.mode ?? 'ssh') === 'local'
+                ? { ...rawMsg, tabId: LOCAL_SHARED_TAB_ID }
+                : rawMsg
             tabId = msg.tabId
-            console.log(`Creating new session for tab ${tabId} (${msg.username}@${msg.host})`)
+            console.log(`Creating new ${msg.mode ?? 'ssh'} session for tab ${tabId}`)
             handleAuth(ws, msg, (session) => { sessions.set(tabId!, session) })
             break
           }
@@ -489,7 +618,7 @@ app.prepare().then(async () => {
             const msg     = JSON.parse(frame.payload.toString('utf8')) as ReconnectMessage
             tabId         = msg.tabId
             const session = sessions.get(tabId)
-            if (session?.conn) {
+            if (session) {
               console.log(`Reconnecting to session ${tabId}`)
               attachToSession(ws, tabId, session)
             } else {
@@ -501,24 +630,19 @@ app.prepare().then(async () => {
           case MsgType.DATA: {
             // Raw binary keystrokes — no UTF-8 decode, no JSON parse
             const dataSession = tabId ? sessions.get(tabId) : undefined
-            if (dataSession?.stream?.writable) {
-              const canContinue = dataSession.stream.write(frame.payload)
+            if (dataSession) {
+              writeToSession(dataSession, frame.payload)
               dataSession.lastActivity = Date.now()
-              if (!canContinue) {
-                ws.pause()
-                dataSession.stream.once('drain', () => ws.resume())
-              }
             }
             break
           }
 
           case MsgType.RESIZE: {
             const { cols, rows } = JSON.parse(frame.payload.toString('utf8')) as ResizeMessage
-            const resizeSession  = tabId ? sessions.get(tabId) : undefined
-            if (resizeSession?.stream) {
-              resizeSession.stream.setWindow(rows, cols, 0, 0)
-              resizeSession.lastActivity = Date.now()
-              resizeSession.headlessTerm?.resize(cols, rows)
+            const activeSession  = tabId ? sessions.get(tabId) : undefined
+            if (activeSession) {
+              resizeSession(activeSession, cols, rows)
+              activeSession.lastActivity = Date.now()
             }
             break
           }

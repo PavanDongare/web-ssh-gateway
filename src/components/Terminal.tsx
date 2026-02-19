@@ -9,7 +9,6 @@ import {
   decodeFrame,
   decodeJsonPayload,
   type TerminalSnapshot,
-  type SnapshotCell,
   ATTR_BOLD,
   ATTR_ITALIC,
   ATTR_UNDERLINE,
@@ -22,9 +21,10 @@ import {
 
 interface TerminalProps {
   tabId: string
-  host: string
-  port: number
-  username: string
+  mode: 'ssh' | 'local'
+  host?: string
+  port?: number
+  username?: string
   password?: string
   privateKey?: string
   passphrase?: string
@@ -139,6 +139,7 @@ function snapshotToVT(snap: TerminalSnapshot): string {
 
 export default function Terminal({
   tabId: propTabId,
+  mode,
   host,
   port,
   username,
@@ -232,8 +233,6 @@ export default function Terminal({
 
         switch (frame.type) {
           case MsgType.CONNECTED:
-            // Erase the "Connecting to …" line so it doesn't linger on success
-            rendererRef.current?.write('\x1b[2K\x1b[1A\x1b[2K\x1b[G')
             isConnecting = false
             reconnectAttempts = 0
             setShowReconnectBtn(false)
@@ -344,11 +343,9 @@ export default function Terminal({
 
       ws.onopen = () => {
         if (aborted) { ws!.close(); return }
-        // Write "Connecting…" only once the socket is actually open (avoids
-        // StrictMode double-mount writing it twice in development).
-        rendererRef.current?.write(`\x1b[33mConnecting to ${host}:${port}...\x1b[0m\r\n`)
         // Fix 6: send auth as binary frame with JSON payload
         ws!.send(encodeJsonFrame(MsgType.AUTH, {
+          mode,
           tabId, host, port, username,
           password, privateKey, passphrase,
         }))
@@ -400,7 +397,7 @@ export default function Terminal({
       }
       wsRef.current = null
     }
-  }, [tabId, host, port, username]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [tabId, mode, host, port, username]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ---------------------------------------------------------------------------
   // Send keystrokes and resize to SSH server

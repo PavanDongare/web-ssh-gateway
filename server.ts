@@ -41,12 +41,11 @@ process.emitWarning = () => {}
 
 const dev      = process.env.NODE_ENV !== 'production'
 const hostname = 'localhost'
-const port     = 3000
+const port     = 3001
 
 const SESSION_TIMEOUT_MS = 300_000   // 5 minutes to reconnect
 const MAX_OUTPUT_BUFFER  = 200 * 1024 // 200 KB ring buffer per session
 const ENABLE_HEADLESS_SNAPSHOT = false // tmux handles session continuity
-const LOCAL_SHARED_TAB_ID = 'local-machine-terminal'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -527,13 +526,8 @@ function handleAuth(
 ): void {
   const mode = msg.mode ?? 'ssh'
   if (mode === 'local') {
-    const localMsg: AuthMessage = { ...msg, tabId: LOCAL_SHARED_TAB_ID, mode: 'local' }
-    const existing = sessions.get(LOCAL_SHARED_TAB_ID)
-    if (existing) {
-      attachToSession(ws, LOCAL_SHARED_TAB_ID, existing)
-      return
-    }
-    handleLocalAuth(ws, localMsg, onReady)
+    // Each local connection gets its own session - no sharing
+    handleLocalAuth(ws, msg, onReady)
     return
   }
   handleSshAuth(ws, msg, onReady)
@@ -603,11 +597,7 @@ app.prepare().then(async () => {
 
         switch (frame.type) {
           case MsgType.AUTH: {
-            const rawMsg = JSON.parse(frame.payload.toString('utf8')) as AuthMessage
-            const msg: AuthMessage =
-              (rawMsg.mode ?? 'ssh') === 'local'
-                ? { ...rawMsg, tabId: LOCAL_SHARED_TAB_ID }
-                : rawMsg
+            const msg = JSON.parse(frame.payload.toString('utf8')) as AuthMessage
             tabId = msg.tabId
             console.log(`Creating new ${msg.mode ?? 'ssh'} session for tab ${tabId}`)
             handleAuth(ws, msg, (session) => { sessions.set(tabId!, session) })

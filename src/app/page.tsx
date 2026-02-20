@@ -18,7 +18,6 @@ interface Tab {
 }
 
 const SAVED_CONNECTIONS_KEY = 'webssh_saved_connections'
-const LOCAL_TAB_ID = 'local-machine-terminal'
 
 function getSavedConnections(): ConnectionConfig[] {
   if (typeof window === 'undefined') return []
@@ -79,16 +78,7 @@ export default function Home() {
 
   const handleConnect = useCallback((config: ConnectionConfig) => {
     const mode = config.mode ?? 'ssh'
-    const tabId = mode === 'local' ? LOCAL_TAB_ID : `tab-${Date.now()}`
-
-    if (mode === 'local') {
-      const existingLocal = tabs.find(t => t.mode === 'local')
-      if (existingLocal) {
-        setActiveTabId(existingLocal.id)
-        setIsModalOpen(false)
-        return
-      }
-    }
+    const tabId = `tab-${Date.now()}`
 
     const newTab: Tab = {
       id: tabId,
@@ -126,18 +116,13 @@ export default function Home() {
   }, [])
 
   const openLocalFromPanel = useCallback(() => {
-    const existingLocal = tabs.find(t => t.mode === 'local')
-    if (existingLocal) {
-      setActiveTabId(existingLocal.id)
-    } else {
-      handleConnect({
-        mode: 'local',
-        name: 'local-terminal',
-        authMethod: 'password',
-      })
-    }
+    handleConnect({
+      mode: 'local',
+      name: 'local-terminal',
+      authMethod: 'password',
+    })
     setIsSavedPanelOpen(false)
-  }, [handleConnect, tabs])
+  }, [handleConnect])
 
   const openSshFromPanel = useCallback((conn: ConnectionConfig) => {
     const existing = tabs.find(

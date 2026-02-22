@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "tsx server.ts",
+    "dev": "tsx --env-file=.env server.ts",
     "build": "next build --webpack",
     "start": "NODE_ENV=production tsx server.ts",
     "lint": "eslint"

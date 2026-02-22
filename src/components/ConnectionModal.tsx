@@ -121,18 +121,30 @@ export default function ConnectionModal({
           </div>
 
           {mode === 'local' && (
-            <div className="space-y-1.5">
-              <label className="block text-xs font-medium text-[#3f3f46]">
-                Session Name
-                <span className="ml-1 text-[#a1a1aa] font-normal">(optional)</span>
-              </label>
-              <input
-                type="text"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                placeholder="My Local Shell"
-                className="w-full px-3 py-2 bg-white border border-[#e4e4e7] rounded-md text-sm text-[#09090b] placeholder-[#a1a1aa] focus:outline-none focus:ring-1 focus:ring-[#09090b] focus:border-[#09090b] transition-colors"
-              />
+            <div className="space-y-4">
+              <div className="space-y-1.5">
+                <label className="block text-xs font-medium text-[#3f3f46]">
+                  Session Name
+                  <span className="ml-1 text-[#a1a1aa] font-normal">(optional)</span>
+                </label>
+                <input
+                  type="text"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  placeholder="My Local Shell"
+                  className="w-full px-3 py-2 bg-white border border-[#e4e4e7] rounded-md text-sm text-[#09090b] placeholder-[#a1a1aa] focus:outline-none focus:ring-1 focus:ring-[#09090b] focus:border-[#09090b] transition-colors"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <label className="block text-xs font-medium text-[#3f3f46]">Admin Password</label>
+                <input
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="••••••••"
+                  className="w-full px-3 py-2 bg-white border border-[#e4e4e7] rounded-md text-sm text-[#09090b] placeholder-[#a1a1aa] focus:outline-none focus:ring-1 focus:ring-[#09090b] focus:border-[#09090b] transition-colors"
+                />
+              </div>
             </div>
           )}
 

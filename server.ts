@@ -40,12 +40,32 @@ process.emitWarning = () => {}
 // ---------------------------------------------------------------------------
 
 const dev      = process.env.NODE_ENV !== 'production'
-const hostname = 'localhost'
-const port     = 3001
+const hostname = '0.0.0.0'
+const port     = parseInt(process.env.PORT || '3001', 10)
 
 const SESSION_TIMEOUT_MS = 300_000   // 5 minutes to reconnect
 const MAX_OUTPUT_BUFFER  = 200 * 1024 // 200 KB ring buffer per session
 const ENABLE_HEADLESS_SNAPSHOT = false // tmux handles session continuity
+
+const MAX_SESSIONS_PER_IP = 5
+const MAX_TOTAL_SESSIONS  = 20
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function isPrivateIP(host: string): boolean {
+  if (host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '0.0.0.0') return true
+  
+  // Basic private range checks
+  const parts = host.split('.').map(Number)
+  if (parts.length === 4) {
+    if (parts[0] === 10) return true
+    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true
+    if (parts[0] === 192 && parts[1] === 168) return true
+  }
+  return false
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -346,6 +366,13 @@ function handleSshAuth(
     ws.send(encodeJsonFrame(MsgType.ERROR, { message: 'Host and username are required' }))
     return
   }
+
+  if (isPrivateIP(host)) {
+    console.warn(`Blocked SSH connection attempt to private/local host: ${host}`)
+    ws.send(encodeJsonFrame(MsgType.ERROR, { message: 'Connections to local/private addresses are not allowed.' }))
+    return
+  }
+
   if (!password && !privateKey) {
     ws.send(encodeJsonFrame(MsgType.ERROR, { message: 'Password or private key is required' }))
     return
@@ -459,6 +486,19 @@ function handleLocalAuth(
   msg: AuthMessage,
   onReady: (session: SessionInternal) => void,
 ): void {
+  const adminPassword = process.env.ADMIN_PASSWORD
+  
+  if (!adminPassword) {
+    ws.send(encodeJsonFrame(MsgType.ERROR, { message: 'Local mode is disabled (ADMIN_PASSWORD not set on server)' }))
+    return
+  }
+
+  if (msg.password !== adminPassword) {
+    console.warn(`Unauthorized Local access attempt from tab ${msg.tabId}`)
+    ws.send(encodeJsonFrame(MsgType.ERROR, { message: 'Incorrect Admin Password' }))
+    return
+  }
+
   const shell = process.env.SHELL || '/bin/zsh'
   const localEnv: Record<string, string> = {}
   for (const [key, value] of Object.entries(process.env)) {
@@ -524,6 +564,12 @@ function handleAuth(
   msg: AuthMessage,
   onReady: (session: SessionInternal) => void,
 ): void {
+  if (sessions.size >= MAX_TOTAL_SESSIONS) {
+    console.warn('Max total sessions reached. Blocking new connection.')
+    ws.send(encodeJsonFrame(MsgType.ERROR, { message: 'Server is at maximum session capacity. Please try again later.' }))
+    return
+  }
+
   const mode = msg.mode ?? 'ssh'
   if (mode === 'local') {
     // Each local connection gets its own session - no sharing

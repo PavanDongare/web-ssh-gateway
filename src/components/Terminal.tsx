@@ -159,6 +159,9 @@ export default function Terminal({
 
   // Fix 2: show a manual reconnect button after max retries
   const [showReconnectBtn, setShowReconnectBtn] = useState(false)
+  const [isConnected, setIsConnected] = useState(false)
+  const [localPassword, setLocalPassword] = useState('')
+  const [needsLocalAuth, setNeedsLocalAuth] = useState(mode === 'local' && !password)
   const reconnectFnRef = useRef<(() => void) | null>(null)
 
   // Stable refs for callbacks
@@ -236,6 +239,7 @@ export default function Terminal({
             isConnecting = false
             reconnectAttempts = 0
             setShowReconnectBtn(false)
+            setIsConnected(true)
             onConnectedRef.current?.()
             break
 
@@ -252,6 +256,7 @@ export default function Terminal({
             isConnecting = false
             reconnectAttempts = 0
             setShowReconnectBtn(false)
+            setIsConnected(true)
             onConnectedRef.current?.()
             // Tell the SSH server our actual terminal dimensions
             {
@@ -347,7 +352,8 @@ export default function Terminal({
         ws!.send(encodeJsonFrame(MsgType.AUTH, {
           mode,
           tabId, host, port, username,
-          password, privateKey, passphrase,
+          password: password || localPassword,
+          privateKey, passphrase,
         }))
       }
       ws.onmessage = (e) => handleMessage(e as MessageEvent<ArrayBuffer>)
@@ -380,7 +386,9 @@ export default function Terminal({
       connect()
     }
 
-    connect()
+    if (!needsLocalAuth) {
+      connect()
+    }
 
     return () => {
       aborted = true
@@ -396,8 +404,9 @@ export default function Terminal({
         ws.close()
       }
       wsRef.current = null
+      setIsConnected(false)
     }
-  }, [tabId, mode, host, port, username]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [tabId, mode, host, port, username, password, localPassword, needsLocalAuth]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ---------------------------------------------------------------------------
   // Send keystrokes and resize to SSH server
@@ -416,14 +425,62 @@ export default function Terminal({
     }
   }
 
+  const handleLocalAuthSubmit = (e: React.FormEvent) => {
+    e.preventDefault()
+    if (localPassword.trim()) {
+      setNeedsLocalAuth(false)
+    }
+  }
+
   return (
-    <div style={{ position: 'relative', width: '100%', height: '100%' }}>
-      <TerminalRenderer
-        ref={rendererRef}
-        onData={handleData}
-        onResize={handleResize}
-        onTranscript={handleData}
-      />
+    <div style={{ position: 'relative', width: '100%', height: '100%', background: '#09090b' }}>
+      {needsLocalAuth ? (
+        <div className="absolute inset-0 flex items-center justify-center bg-[#09090b] z-50 p-4">
+          <div className="w-full max-w-sm bg-white rounded-xl shadow-2xl p-6 border border-[#e4e4e7]">
+            <div className="flex flex-col gap-4">
+              <div className="space-y-1.5">
+                <h3 className="text-lg font-semibold text-[#09090b] tracking-tight">Admin Access</h3>
+                <p className="text-xs text-[#71717a]">Enter the admin password to open a local terminal session.</p>
+              </div>
+              <form onSubmit={handleLocalAuthSubmit} className="space-y-4">
+                <div className="space-y-2">
+                  <input
+                    autoFocus
+                    type="password"
+                    value={localPassword}
+                    onChange={(e) => setLocalPassword(e.target.value)}
+                    placeholder="Enter Admin Password"
+                    className="w-full px-3 py-2 bg-[#f4f4f5] border border-[#e4e4e7] rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-[#09090b] transition-all"
+                  />
+                </div>
+                <button
+                  type="submit"
+                  disabled={!localPassword.trim()}
+                  className="w-full py-2 bg-[#09090b] text-white text-sm font-medium rounded-md hover:bg-[#27272a] disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                >
+                  Connect
+                </button>
+              </form>
+            </div>
+          </div>
+        </div>
+      ) : isConnected ? (
+        <TerminalRenderer
+          ref={rendererRef}
+          onData={handleData}
+          onResize={handleResize}
+          onTranscript={handleData}
+        />
+      ) : (
+        <div className="absolute inset-0 flex items-center justify-center bg-[#09090b]">
+          <div className="flex flex-col items-center gap-3">
+            <div className="w-5 h-5 border-2 border-white/20 border-t-white rounded-full animate-spin" />
+            <span className="text-[11px] font-mono text-white/40 uppercase tracking-widest">
+              Connecting...
+            </span>
+          </div>
+        </div>
+      )}
 
       {/* Fix 2: Manual reconnect button shown after exponential backoff exhausted */}
       {showReconnectBtn && (

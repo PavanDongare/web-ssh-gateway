@@ -116,13 +116,10 @@ export default function Home() {
   }, [])
 
   const openLocalFromPanel = useCallback(() => {
-    const pwd = prompt('Enter Admin Password for Local Terminal:')
-    if (pwd === null) return
     handleConnect({
       mode: 'local',
       name: 'local-terminal',
       authMethod: 'password',
-      password: pwd,
     })
     setIsSavedPanelOpen(false)
   }, [handleConnect])

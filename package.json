@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "tsx --env-file=.env server.ts",
     "build": "next build --webpack",
-    "start": "NODE_ENV=production tsx server.ts",
+    "build:server": "tsc -p tsconfig.server.json",
+    "start": "NODE_ENV=production node --env-file=.env dist-server/server.js",
     "lint": "eslint"
   },
   "dependencies": {
